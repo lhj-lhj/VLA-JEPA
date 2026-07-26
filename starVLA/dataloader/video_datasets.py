@@ -1,79 +1,123 @@
+import bisect
+import json
 import os
 import random
-import torch
-import cv2
+import tempfile
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
-from torch.utils.data import Dataset
 from PIL import Image
+from torch.utils.data import Dataset
 
-from transformers import VJEPA2VideoProcessor
+DEFAULT_INSTRUCTION = "Completing something that humans might want to do."
+
 
 def random_crop_or_pad(video, target_h, target_w, pad_value=0):
     """
     video: np.ndarray [T, H, W, 3]
     return: np.ndarray [T, target_h, target_w, 3]
     """
-    T, H, W, C = video.shape
-    assert C == 3
+    _, height, width, channels = video.shape
+    assert channels == 3
 
-    # 1️⃣ 随机 crop 起点（如果原图更大）
-    top = random.randint(0, H - target_h) if H > target_h else 0
-    left = random.randint(0, W - target_w) if W > target_w else 0
+    top = random.randint(0, height - target_h) if height > target_h else 0
+    left = random.randint(0, width - target_w) if width > target_w else 0
 
     cropped = video[
         :,
-        top : top + min(H, target_h),
-        left : left + min(W, target_w),
-        :
+        top : top + min(height, target_h),
+        left : left + min(width, target_w),
+        :,
     ]
-
-    # 2️⃣ padding（如果原图更小）
-    out = np.full(
-        (T, target_h, target_w, 3),
+    output = np.full(
+        (video.shape[0], target_h, target_w, 3),
         pad_value,
-        dtype=video.dtype
+        dtype=video.dtype,
     )
+    cropped_height, cropped_width = cropped.shape[1:3]
+    output[:, :cropped_height, :cropped_width, :] = cropped
+    return output
 
-    h, w = cropped.shape[1:3]
-    out[:, :h, :w, :] = cropped
-
-    return out
 
 def resize_video(video, target_h, target_w):
     """
     video: np.ndarray [T, H, W, 3]
     return: np.ndarray [T, target_h, target_w, 3]
     """
-    T, H, W, C = video.shape
-    assert C == 3
+    frames, _, _, channels = video.shape
+    assert channels == 3
 
-    out = np.empty((T, target_h, target_w, 3), dtype=video.dtype)
-
-    for t in range(T):
-        out[t] = cv2.resize(
-            video[t],
-            (target_w, target_h),  # 注意：cv2 是 (W, H)
-            interpolation=cv2.INTER_AREA  # 下采样最稳
+    output = np.empty((frames, target_h, target_w, 3), dtype=video.dtype)
+    for frame_index in range(frames):
+        output[frame_index] = np.asarray(
+            Image.fromarray(video[frame_index]).resize(
+                (target_w, target_h),
+                resample=Image.Resampling.BILINEAR,
+            )
         )
+    return output
 
-    return out
+
+def _read_json_labels(path: Path, id2text: dict[int, str]) -> None:
+    with path.open("r", encoding="utf-8") as file:
+        rows = json.load(file)
+    for row in rows:
+        if "id" not in row or "label" not in row:
+            continue
+        try:
+            video_id = int(row["id"])
+        except (TypeError, ValueError):
+            continue
+        id2text[video_id] = str(row["label"])
+
+
+def _read_csv_labels(path: Path, id2text: dict[int, str]) -> None:
+    rows = pd.read_csv(path, sep=";", header=None)
+    for _, row in rows.iterrows():
+        try:
+            video_id = int(row.iloc[0])
+        except (TypeError, ValueError):
+            continue
+        if len(row) > 1 and pd.notna(row.iloc[1]):
+            id2text[video_id] = str(row.iloc[1])
+
+
+def load_id2text(text_file: str) -> dict[int, str]:
+    """Load SSV2 per-video text from the official JSON/CSV metadata."""
+    text_path = Path(text_file)
+    if not text_path.exists():
+        raise FileNotFoundError(f"SSV2 metadata path does not exist: {text_path}")
+
+    id2text: dict[int, str] = {}
+    if text_path.is_dir():
+        for name in ("train.json", "validation.json"):
+            path = text_path / name
+            if path.exists():
+                _read_json_labels(path, id2text)
+        test_answers = text_path / "test-answers.csv"
+        if test_answers.exists():
+            _read_csv_labels(test_answers, id2text)
+    elif text_path.suffix.lower() == ".json":
+        _read_json_labels(text_path, id2text)
+    else:
+        _read_csv_labels(text_path, id2text)
+
+    if not id2text:
+        raise RuntimeError(f"No SSV2 per-video labels found at {text_path}")
+    return id2text
+
 
 def collate_fn(batch, n_views=2, resolution_size=224):
     examples = []
-    for b in batch:
-        video, instruction = b[0], b[1]
-        example = {}
-        example["image"] = [Image.fromarray(video[0]).resize((resolution_size, resolution_size))]
-        example["video"] = np.stack([video, video.copy()], axis=0)  # [n_views, T, H, W, C]
-        example["lang"] = instruction
-        examples.append(example)
-
-        #print(video.shape, video_batch["video"][0].shape)
-        #print(video_batch["image"][0])
-        #print(video_batch["lang"][0])
-        #exit()
+    for video, instruction in batch:
+        examples.append({
+            "image": [Image.fromarray(video[0]).resize((resolution_size, resolution_size))],
+            "video": np.stack([video.copy() for _ in range(n_views)], axis=0),
+            "lang": instruction,
+        })
     return examples
+
 
 class VideoFolderDataset(Dataset):
     def __init__(
@@ -91,70 +135,129 @@ class VideoFolderDataset(Dataset):
         self.max_retry = max_retry
         self.crop_h_size = crop_h_size
         self.crop_w_size = crop_w_size
+        self.extensions = tuple(extension.lower().lstrip(".") for extension in extensions)
+        self.is_parquet = "parquet" in self.extensions
+        self.id2text = load_id2text(text_file)
+        self._cached_parquet_path = None
+        self._cached_parquet_table = None
 
-        # 只扫描文件名
-        self.video_files = [
-            f for f in os.listdir(video_dir)
-            if f.lower().endswith(extensions)
-        ]
-        df = pd.read_csv(text_file, sep=";")
-        self.id2text = dict(zip(df.iloc[:, 0], df.iloc[:, 1]))
-        
-        for each in self.video_files:
-            file_idx = int(each.split(".")[0])
-            if file_idx not in self.id2text:
-                self.id2text[file_idx] = "Completing something that humans might want to do."
+        if self.is_parquet:
+            import pyarrow.parquet as pq
 
-        if len(self.video_files) == 0:
+            self._pq = pq
+            self.video_files = sorted(
+                str(Path(video_dir) / filename)
+                for filename in os.listdir(video_dir)
+                if filename.lower().endswith(".parquet")
+            )
+            if not self.video_files:
+                raise RuntimeError(f"No parquet files found in {video_dir}")
+            row_counts = [pq.ParquetFile(path).metadata.num_rows for path in self.video_files]
+            self._row_offsets = np.cumsum(row_counts).tolist()
+            return
+
+        suffixes = tuple(f".{extension}" for extension in self.extensions)
+        self.video_files = sorted(filename for filename in os.listdir(video_dir) if filename.lower().endswith(suffixes))
+        if not self.video_files:
             raise RuntimeError(f"No video files found in {video_dir}")
 
     def __len__(self):
+        if self.is_parquet:
+            return self._row_offsets[-1]
         return len(self.video_files)
-    
-    def _load_video(self, idx):
-        file_idx = int(self.video_files[idx].split(".")[0])
-        video_path = os.path.join(self.video_dir, self.video_files[idx])
 
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            raise RuntimeError("无法打开视频")
-        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    @staticmethod
+    def _video_id_from_name(name):
+        try:
+            return int(Path(name).stem)
+        except (TypeError, ValueError):
+            return None
 
-        if frame_count < self.n_frames:
-            raise ValueError(f"Video {video_path} has only {frame_count} frames, which is less than the required {self.n_frames} frames.")
+    def _decode_video_path(self, video_path):
+        import av
 
-        start = random.randint(0, frame_count - self.n_frames)
+        try:
+            container = av.open(str(video_path))
+        except av.error.FFmpegError as error:
+            raise RuntimeError(f"Unable to open video: {video_path}") from error
 
-        # 3️⃣ 连续、递增、合法的 frame_ids
-        frame_ids = np.arange(start, start + self.n_frames, dtype=np.int64)
+        try:
+            frames = [frame.to_ndarray(format="rgb24") for frame in container.decode(video=0)]
+        finally:
+            container.close()
 
-        frames = []
-        for idx in frame_ids:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-            ret, frame = cap.read()
-            if not ret:
-                raise ValueError(f"Unable to read frame at index {idx}")
-            frames.append(frame)
-        cap.release()
-        #frames = random_crop_or_pad(
-        #    np.array(frames),
-        #    target_h=self.crop_h_size,
-        #    target_w=self.crop_w_size,
-        #    pad_value=0)
-        frames = resize_video(
-            np.array(frames),
+        if len(frames) < self.n_frames:
+            raise ValueError(
+                f"Video {video_path} has only {len(frames)} frames, "
+                f"which is less than the required {self.n_frames} frames."
+            )
+
+        start = random.randint(0, len(frames) - self.n_frames)
+        return resize_video(
+            np.asarray(frames[start : start + self.n_frames]),
             target_h=self.crop_h_size,
-            target_w=self.crop_w_size)
+            target_w=self.crop_w_size,
+        )
 
-        #print(frames.shape, video_path, file_idx, file_idx in self.id2text.keys())
+    def _load_parquet_video(self, idx):
+        shard_index = bisect.bisect_right(self._row_offsets, idx)
+        previous_offset = 0 if shard_index == 0 else self._row_offsets[shard_index - 1]
+        local_index = idx - previous_offset
+        shard_path = self.video_files[shard_index]
 
-        return [frames, self.id2text[file_idx]]
+        if self._cached_parquet_path != shard_path:
+            self._cached_parquet_table = self._pq.read_table(shard_path, columns=["video"])
+            self._cached_parquet_path = shard_path
+
+        video_record = self._cached_parquet_table.column("video")[local_index].as_py()
+        if not isinstance(video_record, dict) or video_record.get("bytes") is None:
+            raise ValueError(f"Parquet row {idx} does not contain video bytes")
+
+        video_name = video_record.get("path") or f"{idx}.webm"
+        file_index = self._video_id_from_name(video_name)
+        suffix = Path(video_name).suffix or ".webm"
+        temporary_root = Path(
+            os.environ.get(
+                "VLA_JEPA_VIDEO_TMPDIR",
+                str(Path(tempfile.gettempdir()) / "vla_jepa_video_decode"),
+            )
+        )
+        temporary_root.mkdir(parents=True, exist_ok=True)
+
+        temporary_path = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=suffix, dir=temporary_root, delete=False) as file:
+                file.write(video_record["bytes"])
+                temporary_path = file.name
+            frames = self._decode_video_path(temporary_path)
+        finally:
+            if temporary_path is not None:
+                try:
+                    os.remove(temporary_path)
+                except FileNotFoundError:
+                    pass
+
+        instruction = self.id2text.get(file_index, DEFAULT_INSTRUCTION)
+        return [frames, instruction]
+
+    def _load_video(self, idx):
+        if self.is_parquet:
+            return self._load_parquet_video(idx)
+
+        video_name = self.video_files[idx]
+        file_index = self._video_id_from_name(video_name)
+        video_path = os.path.join(self.video_dir, video_name)
+        frames = self._decode_video_path(video_path)
+        instruction = self.id2text.get(file_index, DEFAULT_INSTRUCTION)
+        return [frames, instruction]
 
     def __getitem__(self, idx):
+        last_error = None
         for _ in range(self.max_retry):
             try:
                 return self._load_video(idx)
-            except Exception as e:
-                idx = random.randint(0, len(self.video_files) - 1)
+            except Exception as error:
+                last_error = error
+                idx = random.randint(0, len(self) - 1)
 
-        return self._load_video(2)
+        raise RuntimeError(f"Unable to decode a video after {self.max_retry} attempts") from last_error
