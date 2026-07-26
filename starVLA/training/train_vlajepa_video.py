@@ -206,6 +206,7 @@ class VLATrainer(TrainerUtils):
                 project=self.config.wandb_project,
                 entity=self.config.wandb_entity,
                 group="vla-train",
+                config=OmegaConf.to_container(self.config, resolve=True),
             )
 
     def _init_checkpointing(self):
@@ -244,21 +245,47 @@ class VLATrainer(TrainerUtils):
             self.accelerator.print(f"✅ Checkpoint saved at {checkpoint_path}")
         accelerator.wait_for_everyone()
 
+    def _reduce_scalar(self, value, *, reduction="mean"):
+        """Reduce a scalar metric across ranks before logging it."""
+        metric = torch.as_tensor(value, device=self.accelerator.device, dtype=torch.float32)
+        if dist.is_initialized():
+            op = dist.ReduceOp.MAX if reduction == "max" else dist.ReduceOp.SUM
+            dist.all_reduce(metric, op=op)
+            if reduction == "mean":
+                metric /= dist.get_world_size()
+        return metric.item()
+
     def _log_metrics(self, metrics):
-        """record training metrics"""
+        """Record reduced training, performance, system, and LR metrics."""
         if self.completed_steps % self.config.trainer.logging_frequency == 0:
+            reduced_metrics = {}
+            for name, value in metrics.items():
+                reduction = "max" if name.endswith(("_time", "_memory_gb")) else "mean"
+                namespace = (
+                    "perf"
+                    if name.endswith("_time")
+                    else "system"
+                    if name.endswith("_memory_gb")
+                    else "train"
+                )
+                reduced_metrics[f"{namespace}/{name}"] = self._reduce_scalar(value, reduction=reduction)
+
+            step_time = reduced_metrics["perf/step_time"]
+            reduced_metrics["perf/samples_per_second"] = self.total_batch_size / max(step_time, 1.0e-12)
+            reduced_metrics["progress/epoch"] = round(
+                self.completed_steps / len(self.vla_train_dataloader), 4
+            )
+            reduced_metrics["progress/samples_seen"] = self.completed_steps * self.total_batch_size
+
+            learning_rates = self.lr_scheduler.get_last_lr()
+            for index, (group, learning_rate) in enumerate(zip(self.optimizer.param_groups, learning_rates)):
+                group_name = group.get("name", f"group_{index}")
+                reduced_metrics[f"lr/{group_name}"] = learning_rate
+
             if dist.get_rank() == 0:
-                # add learning rate
-                metrics["learning_rate"] = self.lr_scheduler.get_last_lr()[0]
-
-                # add epoch info
-                metrics["epoch"] = round(self.completed_steps / len(self.vla_train_dataloader), 2)
-
-                # record to W&B
                 if self.wandb_enabled:
-                    wandb.log(metrics, step=self.completed_steps)
-                # debug output
-                logger.info(f"Step {self.completed_steps}, Loss: {metrics})")
+                    wandb.log(reduced_metrics, step=self.completed_steps)
+                logger.info(f"Step {self.completed_steps}, Metrics: {reduced_metrics}")
 
     def _create_data_iterators(self):
         """create data iterators"""
@@ -324,6 +351,10 @@ class VLATrainer(TrainerUtils):
             # record metrics
             step_metrics["data_time"] = t_end_data - t_start_data
             step_metrics["model_time"] = t_end_model - t_start_model
+            step_metrics["step_time"] = t_end_model - t_start_data
+            step_metrics["gpu_allocated_memory_gb"] = torch.cuda.memory_allocated() / (1024**3)
+            step_metrics["gpu_reserved_memory_gb"] = torch.cuda.memory_reserved() / (1024**3)
+            step_metrics["gpu_peak_memory_gb"] = torch.cuda.max_memory_allocated() / (1024**3)
             self._log_metrics(step_metrics)
 
             # save checkpoint
@@ -406,14 +437,20 @@ class VLATrainer(TrainerUtils):
             self.accelerator.backward(total_loss)
 
             # gradient clipping
+            grad_norm = None
             if self.config.trainer.gradient_clipping is not None:
-                self.accelerator.clip_grad_norm_(self.model.parameters(), self.config.trainer.gradient_clipping)
+                grad_norm = self.accelerator.clip_grad_norm_(
+                    self.model.parameters(), self.config.trainer.gradient_clipping
+                )
 
             # optimizer step
             self.optimizer.step()
             self.lr_scheduler.step()
         
-        result_dict = {k: v.item() for k, v in output_dict.items()}
+        result_dict = {k: v.detach().float().item() for k, v in output_dict.items()}
+        result_dict["total_loss"] = total_loss.detach().float().item()
+        if grad_norm is not None:
+            result_dict["grad_norm"] = torch.as_tensor(grad_norm).detach().float().item()
 
         return result_dict
 
