@@ -27,7 +27,10 @@ IGNORE_INDEX = -100
 from starVLA.model.framework.base_framework import baseframework
 from starVLA.model.modules.vlm import get_vlm_model
 from starVLA.model.modules.action_model.GR00T_ActionHeader import get_action_model, FlowmatchingActionHead
-from starVLA.model.modules.world_model.vj2_predictor import VisionTransformerPredictorAC
+from starVLA.model.modules.world_model.vj2_predictor import (
+    VisionTransformerPredictorAC,
+    VisionTransformerPredictorAC_New,
+)
 from starVLA.training.trainer_utils.trainer_tools import resize_images
 from starVLA.model.tools import FRAMEWORK_REGISTRY
 
@@ -82,7 +85,20 @@ class VLA_JEPA(baseframework):
         self.vj_processor = AutoVideoProcessor.from_pretrained(self.config.framework.vj2_model.base_encoder)
 
         tubelet_size = self.vj_encoder.config.tubelet_size
-        self.vj_predictor = VisionTransformerPredictorAC(
+        self.vj_predictor_variant = str(
+            self.config.framework.vj2_model.get("predictor_variant", "original")
+        )
+        predictor_classes = {
+            "original": VisionTransformerPredictorAC,
+            "f0_repeat_noncausal": VisionTransformerPredictorAC_New,
+        }
+        if self.vj_predictor_variant not in predictor_classes:
+            raise ValueError(
+                f"Unsupported V-JEPA predictor_variant={self.vj_predictor_variant!r}; "
+                f"expected one of {tuple(predictor_classes)}."
+            )
+        predictor_cls = predictor_classes[self.vj_predictor_variant]
+        self.vj_predictor = predictor_cls(
             num_frames=self.config.framework.vj2_model.num_frames//tubelet_size,
             img_size=((self.vj_encoder.config.image_size, self.vj_encoder.config.image_size)),
             tubelet_size=1,
@@ -92,9 +108,11 @@ class VLA_JEPA(baseframework):
             action_embed_dim=self.qwen_vl_interface.model.config.hidden_size,
             num_add_tokens=self.config.framework.vj2_model.num_action_tokens_per_timestep,
         )
+        num_vj_states = self.config.framework.vj2_model.num_frames // tubelet_size
+        num_code_groups = num_vj_states if self.vj_predictor_variant == "f0_repeat_noncausal" else num_vj_states - 1
         self.replace_prompt = "".join(
             [each * self.config.framework.vj2_model.num_action_tokens_per_timestep for each in
-             action_tokens[:self.config.framework.vj2_model.num_frames//tubelet_size - 1]]
+             action_tokens[:num_code_groups]]
         )
 
         self.embodied_replace_prompt = "".join([embodied_action_token * self.config.framework.vj2_model.num_embodied_action_tokens_per_instruction])
@@ -225,12 +243,31 @@ class VLA_JEPA(baseframework):
             with torch.no_grad():
                 video_embeddings = self.vj_encoder.get_vision_features(pixel_values_videos=input_videos)
                 video_embeddings = torch.cat(torch.chunk(video_embeddings, chunks=V, dim=0), dim=2)
+                if self.vj_predictor_variant == "f0_repeat_noncausal":
+                    current_videos = input_videos[:, :1].repeat(
+                        1,
+                        self.vj_encoder.config.tubelet_size,
+                        1,
+                        1,
+                        1,
+                    )
+                    current_embeddings = self.vj_encoder.get_vision_features(
+                        pixel_values_videos=current_videos
+                    )
+                    current_embeddings = torch.cat(
+                        torch.chunk(current_embeddings, chunks=V, dim=0),
+                        dim=2,
+                    )
             #print(video_embeddings.shape) # [B, T//tubelet_size * dim_per_frame, V*embed_dim]
         
             # Step 3: VJ Predictor
             T = T // self.vj_encoder.config.tubelet_size
-            input_states = video_embeddings[:, :video_embeddings.shape[1] // T * (T-1),:]  # [B, (T-1)*dim_per_frame, V*embed_dim]
-            gt_states = video_embeddings[:, video_embeddings.shape[1] // T:, :]
+            if self.vj_predictor_variant == "f0_repeat_noncausal":
+                input_states = current_embeddings
+                gt_states = video_embeddings
+            else:
+                input_states = video_embeddings[:, :video_embeddings.shape[1] // T * (T-1),:]  # [B, (T-1)*dim_per_frame, V*embed_dim]
+                gt_states = video_embeddings[:, video_embeddings.shape[1] // T:, :]
             #print(input_states.shape, action_tokens.shape)
             #exit()
             predicted_states = self.vj_predictor(
