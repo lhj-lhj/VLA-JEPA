@@ -196,8 +196,166 @@ class VisionTransformerPredictorAC(nn.Module):
         return x
 
 
+class VisionTransformerPredictorAC_New(VisionTransformerPredictorAC):
+    """Predict all target states from repeated copies of one current state."""
+
+    def __init__(
+        self,
+        img_size=(224, 224),
+        patch_size=16,
+        num_frames=1,
+        tubelet_size=2,
+        embed_dim=768,
+        predictor_embed_dim=1024,
+        depth=24,
+        num_heads=16,
+        mlp_ratio=4.0,
+        qkv_bias=True,
+        qk_scale=None,
+        drop_rate=0.0,
+        attn_drop_rate=0.0,
+        drop_path_rate=0.0,
+        norm_layer=nn.LayerNorm,
+        init_std=0.02,
+        uniform_power=True,
+        use_silu=False,
+        wide_silu=True,
+        is_frame_causal=False,
+        use_activation_checkpointing=False,
+        use_rope=True,
+        action_embed_dim=7,
+        use_extrinsics=False,
+        num_add_tokens=8,
+        **kwargs
+    ):
+        if is_frame_causal:
+            raise ValueError("VisionTransformerPredictorAC_New only supports non-causal attention.")
+        super().__init__(
+            img_size=img_size,
+            patch_size=patch_size,
+            num_frames=num_frames,
+            tubelet_size=tubelet_size,
+            embed_dim=embed_dim,
+            predictor_embed_dim=predictor_embed_dim,
+            depth=depth,
+            num_heads=num_heads,
+            mlp_ratio=mlp_ratio,
+            qkv_bias=qkv_bias,
+            qk_scale=qk_scale,
+            drop_rate=drop_rate,
+            attn_drop_rate=attn_drop_rate,
+            drop_path_rate=drop_path_rate,
+            norm_layer=norm_layer,
+            init_std=init_std,
+            uniform_power=uniform_power,
+            use_silu=use_silu,
+            wide_silu=wide_silu,
+            is_frame_causal=False,
+            use_activation_checkpointing=use_activation_checkpointing,
+            use_rope=use_rope,
+            action_embed_dim=action_embed_dim,
+            use_extrinsics=use_extrinsics,
+            num_add_tokens=num_add_tokens,
+            **kwargs
+        )
+        self.num_add_tokens = int(num_add_tokens)
+
+    def forward(self, x, actions, extrinsics=None):
+        """
+        :param x: one current-state token grid [B, p_H*p_W, D]
+        :param actions: target-state condition tokens [B, T * num, D]
+        """
+        # Keep the original predictor projections and transformer blocks. The only
+        # structural change is to repeat one current state across all target states.
+        x = self.predictor_embed(x)
+        B, N_ctxt, D = x.size()
+        tokens_per_state = self.grid_height * self.grid_width
+        if N_ctxt != tokens_per_state:
+            raise ValueError(
+                "VisionTransformerPredictorAC_New expects exactly one current state "
+                f"with {tokens_per_state} tokens, got {N_ctxt}."
+            )
+
+        T = self.num_frames // self.tubelet_size
+        if T <= 0:
+            raise ValueError(
+                f"Expected at least one target state, got num_frames={self.num_frames} "
+                f"and tubelet_size={self.tubelet_size}."
+            )
+
+        x = x.unsqueeze(1).expand(-1, T, -1, -1)
+
+        # The action-code groups align one-to-one with the target states.
+        if actions.size(0) != B:
+            raise ValueError(f"Batch mismatch: current states batch={B}, actions batch={actions.size(0)}.")
+        expected_action_tokens = T * self.num_add_tokens
+        if actions.size(1) != expected_action_tokens:
+            raise ValueError(
+                f"Expected {expected_action_tokens} action tokens for {T} target states, "
+                f"got {actions.size(1)}."
+            )
+
+        # Reuse the original action-token projection and interleaving layout.
+        a = self.action_encoder(actions)
+        a = a.view(B, T, self.num_add_tokens, D)
+        cond_tokens = self.num_add_tokens
+
+        if self.use_extrinsics:
+            if extrinsics is None:
+                raise ValueError("extrinsics are required when use_extrinsics=True.")
+            cond_tokens += 1
+            e = self.extrinsics_encoder(extrinsics).unsqueeze(2)
+            x = torch.cat([a, e, x], dim=2).flatten(1, 2)
+        else:
+            x = torch.cat([a, x], dim=2).flatten(1, 2)
+
+        # All four predicted states may communicate. There are no future target
+        # tokens in x, so full attention does not introduce target leakage.
+        for blk in self.predictor_blocks:
+            if self.use_activation_checkpointing:
+                x = torch.utils.checkpoint.checkpoint(
+                    blk,
+                    x,
+                    mask=None,
+                    attn_mask=None,
+                    T=T,
+                    H=self.grid_height,
+                    W=self.grid_width,
+                    action_tokens=cond_tokens,
+                    use_reentrant=False,
+                )
+            else:
+                x = blk(
+                    x,
+                    mask=None,
+                    attn_mask=None,
+                    T=T,
+                    H=self.grid_height,
+                    W=self.grid_width,
+                    action_tokens=cond_tokens,
+                )
+
+        # Remove condition tokens and preserve the original flattened output format.
+        x = x.view(B, T, cond_tokens + tokens_per_state, D)
+        x = x[:, :, cond_tokens:, :].flatten(1, 2)
+        x = self.predictor_norm(x)
+        x = self.predictor_proj(x)
+
+        return x
+
+
 def vit_ac_predictor(**kwargs):
     model = VisionTransformerPredictorAC(
+        mlp_ratio=4,
+        qkv_bias=True,
+        norm_layer=partial(nn.LayerNorm, eps=1e-6),
+        **kwargs
+    )
+    return model
+
+
+def vit_ac_predictor_new(**kwargs):
+    model = VisionTransformerPredictorAC_New(
         mlp_ratio=4,
         qkv_bias=True,
         norm_layer=partial(nn.LayerNorm, eps=1e-6),
