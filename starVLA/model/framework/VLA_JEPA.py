@@ -131,6 +131,7 @@ class VLA_JEPA(baseframework):
     def forward(
         self,
         examples: List[dict] = None,
+        compute_zero_code_metric: bool = False,
         **kwargs,
     ) -> Tuple:
         """
@@ -242,9 +243,26 @@ class VLA_JEPA(baseframework):
                 gt_states,
                 reduction="mean"
             )
+
+            diagnostic_metrics = {}
+            if compute_zero_code_metric:
+                with torch.no_grad():
+                    zero_code_predicted_states = self.vj_predictor(
+                        input_states,
+                        torch.zeros_like(action_tokens),
+                    )
+                    zero_code_wm_l1 = F.l1_loss(
+                        zero_code_predicted_states,
+                        gt_states,
+                        reduction="mean",
+                    )
+                diagnostic_metrics = {
+                    "normal_code_wm_l1_metric": teacher_forcing_wm_loss.detach(),
+                    "zero_code_wm_l1_metric": zero_code_wm_l1,
+                }
         
         if "action" not in examples[0]:
-            return {"wm_loss": teacher_forcing_wm_loss}
+            return {"wm_loss": teacher_forcing_wm_loss, **diagnostic_metrics}
 
         # Step 4: Action Expert Forward and Loss
         with torch.autocast("cuda", dtype=torch.float32):
@@ -272,7 +290,11 @@ class VLA_JEPA(baseframework):
             #exit()
             action_loss = self.action_model(embodied_action_repeated, actions_target_repeated, state_repeated)  # (B, chunk_len, action_dim)
 
-        return {"action_loss": action_loss, "wm_loss": teacher_forcing_wm_loss * 0.1}
+        return {
+            "action_loss": action_loss,
+            "wm_loss": teacher_forcing_wm_loss * 0.1,
+            **diagnostic_metrics,
+        }
 
     @torch.inference_mode()
     def predict_action(
