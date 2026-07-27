@@ -1,0 +1,97 @@
+run_id: ssv2_10k_2gpu_b128_west1
+run_root_dir: /workspace/hongjia/Unified_Model/outputs/vla_jepa_ssv2_10k
+seed: 42
+trackers: [json, wandb]
+wandb_entity: hongjia-liu-aalto-university
+wandb_project: vla-jepa-ssv2-pretrain
+is_debug: false
+
+framework:
+  name: VLA_JEPA
+  qwenvl:
+    base_vlm: /workspace/hongjia/checkpoints/Qwen3-VL-2B-Instruct
+    attn_implementation: flash_attention_2
+    vl_hidden_dim: 2048
+  action_model:
+    action_model_type: DiT-B
+    action_hidden_dim: 1024
+    hidden_size: 1024
+    add_pos_embed: true
+    max_seq_len: 1024
+    action_dim: 7
+    state_dim: 8
+    future_action_window_size: 6
+    action_horizon: 7
+    past_action_window_size: 0
+    repeated_diffusion_steps: 8
+    noise_beta_alpha: 1.5
+    noise_beta_beta: 1.0
+    noise_s: 0.999
+    num_timestep_buckets: 1000
+    num_inference_timesteps: 4
+    num_target_vision_tokens: 32
+    diffusion_model_cfg:
+      cross_attention_dim: 2048
+      dropout: 0.2
+      final_dropout: true
+      interleave_self_attention: true
+      norm_type: ada_norm
+      num_layers: 16
+      output_dim: 1024
+      positional_embeddings: null
+  vj2_model:
+    base_encoder: /workspace/hongjia/checkpoints/vjepa2-vitl-fpc64-256
+    depth: 12
+    num_heads: 8
+    special_action_token: <|action_{}|>
+    num_action_tokens_per_timestep: 8
+    embodied_action_token: <|embodied_action|>
+    num_embodied_action_tokens_per_instruction: 32
+    num_frames: 8
+  reduce_in_full_precision: true
+
+datasets:
+  video_data:
+    dataset_py: video_datasets
+    video_dir: /workspace/datasets/something_something_v2/data
+    text_file: /workspace/datasets/something_something_v2/labels
+    CoT_prompt: "Your task is {instruction}. Infer the temporal dynamics of future frames {actions}."
+    extensions: [parquet]
+    resolution_size: 224
+    video_resolution_size: 256
+    per_device_batch_size: 128
+
+trainer:
+  epochs: 100
+  max_train_steps: 10000
+  num_warmup_steps: 1000
+  save_interval: 1000
+  eval_interval: 100
+  learning_rate:
+    base: 1.0e-05
+    qwen_vl_interface: 1.0e-05
+    action_model: 1.0e-04
+  lr_scheduler_type: cosine
+  scheduler_specific_kwargs: {}
+  # SSV2 contains no robot actions. The action head remains configured at 1e-4
+  # for later DROID co-training, but is frozen and unused in this SSV2-only run.
+  freeze_modules: vj_encoder,action_model
+  loss_scale:
+    vla: 1.0
+    vlm: 0.1
+  max_grad_norm: 1.0
+  warmup_ratio: 0.1
+  weight_decay: 0.0
+  logging_frequency: 10
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 1
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-08
+  is_resume: false
+  resume_epoch: null
+  resume_step: null
+  enable_gradient_checkpointing: true
+  enable_mixed_precision_training: true
