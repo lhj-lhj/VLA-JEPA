@@ -429,8 +429,23 @@ class VLATrainer(TrainerUtils):
 
             # VLA task forward propagation
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                output_dict = self.model.forward(batch_vla)
-
+                next_step = self.completed_steps + 1
+                compute_zero_code_metric = (
+                    self.accelerator.sync_gradients
+                    and next_step % self.config.trainer.logging_frequency == 0
+                )
+                output_dict = self.model.forward(
+                    batch_vla,
+                    compute_zero_code_metric=compute_zero_code_metric,
+                )
+                normal_code_wm_l1 = output_dict.pop(
+                    "normal_code_wm_l1_metric",
+                    None,
+                )
+                zero_code_wm_l1 = output_dict.pop(
+                    "zero_code_wm_l1_metric",
+                    None,
+                )
                 total_loss = sum(output_dict.values())
 
             # VLA backward propagation
@@ -448,6 +463,17 @@ class VLATrainer(TrainerUtils):
             self.lr_scheduler.step()
         
         result_dict = {k: v.detach().float().item() for k, v in output_dict.items()}
+        if normal_code_wm_l1 is not None and zero_code_wm_l1 is not None:
+            normal_code_l1 = normal_code_wm_l1.detach().float().item()
+            zero_code_l1 = zero_code_wm_l1.detach().float().item()
+            code_gain_l1 = zero_code_l1 - normal_code_l1
+            result_dict["normal_code_wm_l1"] = normal_code_l1
+            result_dict["zero_code_wm_l1"] = zero_code_l1
+            result_dict["code_gain_l1"] = code_gain_l1
+            result_dict["code_gain_fraction"] = code_gain_l1 / max(
+                abs(zero_code_l1),
+                1.0e-12,
+            )
         result_dict["total_loss"] = total_loss.detach().float().item()
         if grad_norm is not None:
             result_dict["grad_norm"] = torch.as_tensor(grad_norm).detach().float().item()
