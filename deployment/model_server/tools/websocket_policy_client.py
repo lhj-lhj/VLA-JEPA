@@ -2,6 +2,7 @@
 # Licensed under the MIT License, Version 1.0 (the "License"); 
 # Implemented by [Jinhui YE / HKUST University] in [2025].
 
+import inspect
 import logging, argparse
 import time, os
 from typing import Dict, Optional, Tuple
@@ -43,15 +44,20 @@ class WebsocketClientPolicy:
             
             try:
                 headers = {"Authorization": f"Api-Key {self._api_key}"} if self._api_key else None
-                conn = websockets.sync.client.connect(
-                    self._uri,
-                    compression=None,
-                    max_size=None,
-                    additional_headers=headers,
-                    open_timeout=150,
-                    ping_interval=20,
-                    ping_timeout=20,
-                )
+                connect_kwargs = {
+                    "compression": None,
+                    "max_size": None,
+                    "additional_headers": headers,
+                    "open_timeout": 150,
+                }
+                # websockets 13 (used by the LIBERO Python 3.8 environment)
+                # doesn't expose the keepalive arguments accepted by newer releases.
+                connect_params = inspect.signature(websockets.sync.client.connect).parameters
+                if "ping_interval" in connect_params:
+                    connect_kwargs["ping_interval"] = 20
+                if "ping_timeout" in connect_params:
+                    connect_kwargs["ping_timeout"] = 20
+                conn = websockets.sync.client.connect(self._uri, **connect_kwargs)
                 metadata = msgpack_numpy.unpackb(conn.recv())
                 return conn, metadata
             except ConnectionRefusedError:
