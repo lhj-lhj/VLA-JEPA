@@ -110,10 +110,13 @@ def load_id2text(text_file: str) -> dict[int, str]:
 
 def collate_fn(batch, n_views=2, resolution_size=224):
     examples = []
-    for video, instruction in batch:
+    for video, instruction, video_fps in batch:
         examples.append({
             "image": [Image.fromarray(video[0]).resize((resolution_size, resolution_size))],
             "video": np.stack([video.copy() for _ in range(n_views)], axis=0),
+            # Qwen receives already-decoded frames, so it cannot recover timing
+            # from a file container later. Keep the source FPS with the sample.
+            "video_fps": float(video_fps),
             "lang": instruction,
         })
     return examples
@@ -182,6 +185,21 @@ class VideoFolderDataset(Dataset):
             raise RuntimeError(f"Unable to open video: {video_path}") from error
 
         try:
+            video_stream = container.streams.video[0]
+            # Qwen's video processor accepts one scalar FPS. Prefer the stream's
+            # average rate and use PyAV's other rate estimates only when the
+            # container does not expose it (common for some WebM encodings).
+            source_rate = (
+                video_stream.average_rate
+                or getattr(video_stream, "guessed_rate", None)
+                or getattr(video_stream, "base_rate", None)
+            )
+            if source_rate is None:
+                raise ValueError(f"Unable to determine video FPS for {video_path}")
+            source_fps = float(source_rate)
+            if not np.isfinite(source_fps) or source_fps <= 0:
+                raise ValueError(f"Invalid video FPS {source_fps} for {video_path}")
+
             frames = [frame.to_ndarray(format="rgb24") for frame in container.decode(video=0)]
         finally:
             container.close()
@@ -193,11 +211,14 @@ class VideoFolderDataset(Dataset):
             )
 
         start = random.randint(0, len(frames) - self.n_frames)
-        return resize_video(
+        frames = resize_video(
             np.asarray(frames[start : start + self.n_frames]),
             target_h=self.crop_h_size,
             target_w=self.crop_w_size,
         )
+        # The selected clip is contiguous, without temporal subsampling, so its
+        # sampling FPS is identical to the decoded source FPS.
+        return frames, source_fps
 
     def _load_parquet_video(self, idx):
         shard_index = bisect.bisect_right(self._row_offsets, idx)
@@ -229,7 +250,7 @@ class VideoFolderDataset(Dataset):
             with tempfile.NamedTemporaryFile(suffix=suffix, dir=temporary_root, delete=False) as file:
                 file.write(video_record["bytes"])
                 temporary_path = file.name
-            frames = self._decode_video_path(temporary_path)
+            frames, video_fps = self._decode_video_path(temporary_path)
         finally:
             if temporary_path is not None:
                 try:
@@ -238,7 +259,7 @@ class VideoFolderDataset(Dataset):
                     pass
 
         instruction = self.id2text.get(file_index, DEFAULT_INSTRUCTION)
-        return [frames, instruction]
+        return [frames, instruction, video_fps]
 
     def _load_video(self, idx):
         if self.is_parquet:
@@ -247,9 +268,9 @@ class VideoFolderDataset(Dataset):
         video_name = self.video_files[idx]
         file_index = self._video_id_from_name(video_name)
         video_path = os.path.join(self.video_dir, video_name)
-        frames = self._decode_video_path(video_path)
+        frames, video_fps = self._decode_video_path(video_path)
         instruction = self.id2text.get(file_index, DEFAULT_INSTRUCTION)
-        return [frames, instruction]
+        return [frames, instruction, video_fps]
 
     def __getitem__(self, idx):
         last_error = None

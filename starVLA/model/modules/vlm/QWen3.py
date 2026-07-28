@@ -104,17 +104,79 @@ class _QWen3_VL_Interface(nn.Module):
             )
         return generation_output
 
-    def build_qwenvl_inputs(self, images, instructions, solutions=None, prompt_replace_dict=None, prompt_template=None, **kwargs):
+    def build_qwenvl_inputs(
+        self,
+        images,
+        instructions,
+        solutions=None,
+        prompt_replace_dict=None,
+        prompt_template=None,
+        *,
+        videos=None,
+        video_fps=None,
+        video_resized_height=None,
+        video_resized_width=None,
+        **kwargs,
+    ):
         """
-        Build model inputs from raw data (images + instructions + optional solutions).
-        Follow Oficial Qwen3-VL Instruct format: https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct
+        Build Qwen3-VL inputs from images or already-decoded video frames.
+
+        The legacy image path intentionally keeps using ``apply_chat_template``
+        directly. For video, use Qwen's official ``process_vision_info`` path so
+        frame-rate metadata reaches Qwen3-VL's temporal position construction.
+        ``videos`` is a batch of frame lists and ``video_fps`` contains the
+        corresponding sampling rate for each list.
         """
 
         # Create messages: one message per sample
         messages = []
-        assert len(images) == len(instructions), "Images and instructions must have the same length"
-        for imgs, instruction in zip(images, instructions):
-            content = [{"type": "image", "image": img} for img in imgs]
+        if videos is None:
+            assert len(images) == len(instructions), "Images and instructions must have the same length"
+        else:
+            if video_fps is None:
+                raise ValueError("video_fps is required when building Qwen video inputs.")
+            if len(videos) != len(instructions) or len(video_fps) != len(instructions):
+                raise ValueError(
+                    "Videos, video FPS values, and instructions must have the same batch length."
+                )
+            if (video_resized_height is None) != (video_resized_width is None):
+                raise ValueError(
+                    "video_resized_height and video_resized_width must be set together."
+                )
+
+        for sample_index, instruction in enumerate(instructions):
+            if videos is None:
+                content = [
+                    {"type": "image", "image": img}
+                    for img in images[sample_index]
+                ]
+            else:
+                sample_video_fps = float(video_fps[sample_index])
+                if sample_video_fps <= 0:
+                    raise ValueError(
+                        f"Video FPS must be positive, got {sample_video_fps} "
+                        f"for sample {sample_index}."
+                    )
+
+                # qwen-vl-utils explicitly reads sample_fps/raw_fps for an
+                # in-memory frame list. Supplying both prevents its 2 FPS
+                # fallback and lets the processor build correct timestamps.
+                video_content = {
+                    "type": "video",
+                    "video": videos[sample_index],
+                    "sample_fps": sample_video_fps,
+                    "raw_fps": sample_video_fps,
+                }
+                if video_resized_height is not None:
+                    # Resize once inside the official qwen-vl-utils pipeline;
+                    # ``do_resize=False`` below prevents a second resize.
+                    video_content.update(
+                        {
+                            "resized_height": int(video_resized_height),
+                            "resized_width": int(video_resized_width),
+                        }
+                    )
+                content = [video_content]
 
             if prompt_template is None:
                 if "CoT_prompt" in self.config.datasets.vla_data:  # If using a grounding prompt to task
@@ -141,16 +203,49 @@ class _QWen3_VL_Interface(nn.Module):
                 msg.append({"role": "assistant", "content": [{"type": "text", "text": solution}]})
             messages.append(msg)
 
-        # Preparation for inference
+        if videos is None:
+            # Preserve the established image preprocessing exactly for existing
+            # VLA-JEPA configurations and checkpoints.
+            batch_inputs = self.processor.apply_chat_template(
+                messages,
+                tokenize=True,
+                padding=True,
+                add_generation_prompt=True,
+                return_dict=True,
+                return_tensors="pt",
+            )
+        else:
+            # Official Qwen3-VL video preprocessing. ``process_vision_info``
+            # converts the frame lists and returns their temporal metadata;
+            # passing that metadata to the processor is what avoids an inferred
+            # or default FPS.
+            text_inputs = self.processor.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            image_inputs, video_inputs, video_kwargs = process_vision_info(
+                messages,
+                image_patch_size=self.processor.image_processor.patch_size,
+                return_video_kwargs=True,
+                return_video_metadata=True,
+            )
+            video_metadata = None
+            if video_inputs is not None:
+                video_inputs, video_metadata = zip(*video_inputs)
+                video_inputs = list(video_inputs)
+                video_metadata = list(video_metadata)
 
-        batch_inputs = self.processor.apply_chat_template(
-        messages,
-        tokenize=True,
-        padding=True,
-        add_generation_prompt=True,
-        return_dict=True,
-        return_tensors="pt"
-        )
+            batch_inputs = self.processor(
+                text=text_inputs,
+                images=image_inputs,
+                videos=video_inputs,
+                video_metadata=video_metadata,
+                padding=True,
+                return_tensors="pt",
+                do_resize=False,
+                **video_kwargs,
+            )
 
         #for k, v in batch_inputs.items():
         #    print(k, v.shape if isinstance(v, torch.Tensor) else v)
