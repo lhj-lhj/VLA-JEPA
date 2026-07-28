@@ -62,6 +62,19 @@ class VLA_JEPA(baseframework):
         super().__init__()
         self.config = config
         self.qwen_vl_interface = get_vlm_model(config=self.config)
+        qwenvl_config = self.config.framework.get("qwenvl", {})
+        self.qwen_input_mode = str(qwenvl_config.get("input_mode", "image")).lower()
+        if self.qwen_input_mode not in {"image", "video"}:
+            raise ValueError(
+                f"Unsupported Qwen input_mode={self.qwen_input_mode!r}; "
+                "expected 'image' or 'video'."
+            )
+        self.qwen_video_resized_height = int(
+            qwenvl_config.get("video_resized_height", 224)
+        )
+        self.qwen_video_resized_width = int(
+            qwenvl_config.get("video_resized_width", 224)
+        )
         embodied_action_token = self.config.framework.vj2_model.get("embodied_action_token", "<|embodied_action|>")
         action_tokens, self.action_token_ids, self.embodied_action_token_id = self.expand_tokenizer(
             tokenizer=self.qwen_vl_interface.processor.tokenizer,
@@ -162,6 +175,36 @@ class VLA_JEPA(baseframework):
         
         state = [example["state"] for example in examples] if "state" in examples[0] else None  # [B, 1, state_dim]
 
+        qwen_video_kwargs = {}
+        if self.qwen_input_mode == "video":
+            missing_fps = [
+                sample_index
+                for sample_index, example in enumerate(examples)
+                if "video_fps" not in example
+            ]
+            if missing_fps:
+                raise ValueError(
+                    "Qwen video input requires dataset-provided video_fps; "
+                    f"missing for samples {missing_fps}."
+                )
+
+            # SSV2 currently creates two identical V-JEPA views. Qwen needs one
+            # temporal stream, so pass the first view's full eight-frame clip
+            # instead of duplicating the same video in its context.
+            qwen_videos = [
+                [
+                    frame if isinstance(frame, Image.Image) else Image.fromarray(frame)
+                    for frame in example["video"][0]
+                ]
+                for example in examples
+            ]
+            qwen_video_kwargs = {
+                "videos": qwen_videos,
+                "video_fps": [float(example["video_fps"]) for example in examples],
+                "video_resized_height": self.qwen_video_resized_height,
+                "video_resized_width": self.qwen_video_resized_width,
+            }
+
         """
         if self.action_model.device == torch.device("cuda:0") and "action" in examples[0]:
             print(batch_videos[0].shape) #[V, T, H, W, 3]
@@ -200,13 +243,17 @@ class VLA_JEPA(baseframework):
                 images=batch_images, 
                 instructions=instructions,
                 prompt_replace_dict={"{actions}":self.replace_prompt, "{e_actions}":self.embodied_replace_prompt},
-                prompt_template=self.config.datasets.vla_data.get("CoT_prompt", "")) 
+                prompt_template=self.config.datasets.vla_data.get("CoT_prompt", ""),
+                **qwen_video_kwargs,
+            )
         else:
             qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(
                 images=batch_images, 
                 instructions=instructions,
                 prompt_replace_dict={"{actions}":self.replace_prompt},
-                prompt_template=self.config.datasets.video_data.get("CoT_prompt", ""))
+                prompt_template=self.config.datasets.video_data.get("CoT_prompt", ""),
+                **qwen_video_kwargs,
+            )
         
         action_indices = torch.isin(qwen_inputs['input_ids'], torch.tensor(self.action_token_ids, device=qwen_inputs['input_ids'].device))
         action_indices = action_indices.nonzero(as_tuple=True)

@@ -12,6 +12,11 @@ framework:
     base_vlm: /workspace/hongjia/checkpoints/Qwen3-VL-2B-Instruct
     attn_implementation: flash_attention_2
     vl_hidden_dim: 2048
+    # Feed Qwen the same eight-frame temporal clip used by the SSV2 experiment.
+    # Other configs remain on the backward-compatible single-image default.
+    input_mode: video
+    video_resized_height: 224
+    video_resized_width: 224
   action_model:
     action_model_type: DiT-B
     action_hidden_dim: 1024
