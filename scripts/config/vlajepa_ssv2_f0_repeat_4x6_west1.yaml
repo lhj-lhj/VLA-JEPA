@@ -61,7 +61,7 @@ datasets:
     dataset_py: video_datasets
     video_dir: /workspace/datasets/something_something_v2/data
     text_file: /workspace/datasets/something_something_v2/labels
-    CoT_prompt: "Your task is {instruction}. Infer the temporal dynamics of future frames {actions}."
+    CoT_prompt: "Your task is {instruction}. Infer the temporal dynamics from videos {actions}."
     extensions: [parquet]
     resolution_size: 224
     video_resolution_size: 256
