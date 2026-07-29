@@ -69,30 +69,25 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe"): # TODO now here on
 
         vla_dataset = get_lerobot_v3_datasets(data_cfg=vla_dataset_cfg)
 
-        custom_collate_fn = partial(collate_fn, 
-            img_keys=cfg.datasets.vla_data.img_keys,
-            state_key=cfg.datasets.vla_data.state_key if "state_key" in cfg.datasets.vla_data else None,
-            action_key=cfg.datasets.vla_data.action_key if cfg.datasets.vla_data.action_key else None,
-            task_key=cfg.datasets.vla_data.task_key if cfg.datasets.vla_data.task_key else None,
-            resize_size=cfg.datasets.vla_data.resize_size)
-
-
-
-        train_sampler = torch.utils.data.distributed.DistributedSampler(vla_dataset, shuffle=True)
+        train_sampler = (
+            torch.utils.data.distributed.DistributedSampler(vla_dataset, shuffle=True)
+            if dist.is_initialized()
+            else None
+        )
+        num_workers = int(vla_dataset_cfg.get("num_workers", 8))
 
         vla_train_dataloader = DataLoader(
             vla_dataset,
-            batch_size=cfg.datasets.vla_data.per_device_batch_size,
-            collate_fn=custom_collate_fn,
-            num_workers=16,
+            batch_size=vla_dataset_cfg.per_device_batch_size,
+            collate_fn=collate_fn,
+            num_workers=num_workers,
             sampler=train_sampler,
-        )      
-        #if dist.get_rank() == 0: 
-        #    for batch in vla_train_dataloader:
-        #        print(batch)
-        #        for k, v in batch.items():
-        #            print(f"{k}: {v.shape if isinstance(v, torch.Tensor) else v}")
-        #        break
+            shuffle=train_sampler is None,
+            pin_memory=True,
+            persistent_workers=num_workers > 0,
+        )
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            save_dataset_statistics(vla_dataset.dataset_statistics, Path(cfg.output_dir))
         return vla_train_dataloader
     elif dataset_py == "video_datasets":
         from starVLA.dataloader.video_datasets import VideoFolderDataset, collate_fn
