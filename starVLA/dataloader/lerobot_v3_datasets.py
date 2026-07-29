@@ -1,100 +1,270 @@
-import bisect
+"""Thin adapter from an official LeRobot v3 dataset to starVLA examples.
+
+LeRobot owns the v3 metadata, parquet/image decoding, episode boundary
+clamping, delta timestamps, task lookup, and padding masks.  This file only
+adapts one decoded sample to the list-of-dicts format consumed by VLA_JEPA.
+"""
+
+from __future__ import annotations
+
+from copy import deepcopy
+from importlib.metadata import PackageNotFoundError, version
+from pathlib import Path
+from typing import Any
+
+import numpy as np
 import torch
+import torch.nn.functional as F
+from PIL import Image
 from torch.utils.data import Dataset
-import os
-import lerobot
-from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
-import torchvision.transforms as T
-to_pil = T.ToPILImage()
-
-from starVLA.dataloader.gr00t_lerobot.mixtures import DATASET_NAMED_MIXTURES
-
-def collate_fn(batch, img_keys, state_key, action_key, task_key, resize_size):
-    examples = []
-    for _, b in enumerate(batch):
-        example = {"image": []}
-        example["action"] = b[action_key].cpu().numpy()
-        example["lang"] = b[task_key]
-
-        for k in img_keys:
-            img_primary = to_pil(b[k][0]).resize((resize_size, resize_size))
-            example["image"].append(img_primary)
-            
-        for k in b.keys():
-            if k == state_key:
-                example["state"] = b[k][0:1].cpu().numpy()
-        examples.append(example)
-    return examples
-
-class MixtureDataset(Dataset):
-    def __init__(self, datasets):
-        """
-        datasets: List[Dataset]
-        """
-        self.datasets = datasets
-        # prefix sum of lengths，用于快速定位 index 属于哪个 dataset
-        self.cumulative_sizes = self._compute_cumulative_sizes()
-
-    def _compute_cumulative_sizes(self):
-        sizes = []
-        total = 0
-        for ds in self.datasets:
-            total += len(ds)
-            sizes.append(total)
-        return sizes
-
-    def __len__(self):
-        return self.cumulative_sizes[-1]
-
-    def __getitem__(self, idx):
-        # 找到 idx 属于哪个 dataset
-        ds_idx = bisect.bisect_right(self.cumulative_sizes, idx)
-        if ds_idx == 0:
-            sample_idx = idx
-        else:
-            sample_idx = idx - self.cumulative_sizes[ds_idx - 1]
-        return self.datasets[ds_idx][sample_idx]
 
 
-def get_lerobot_v3_datasets(
-    data_cfg: dict,
-):
-    data_root_dir = data_cfg.data_root_dir
-    data_mix = data_cfg.data_mix
-    action_horizon = data_cfg.action_horizon
-    mixture_spec = DATASET_NAMED_MIXTURES[data_mix]
+def collate_fn(batch: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep starVLA's existing list-of-example batch contract."""
 
-    included_datasets, filtered_mixture_spec = set(), []
-    for d_name, d_weight, robot_type in mixture_spec:  
-        dataset_key = (d_name, robot_type)  
-        if dataset_key in included_datasets:
-            print(f"Skipping Duplicate Dataset: `{(d_name, d_weight, robot_type)}`")
-            continue
+    return batch
 
-        included_datasets.add(dataset_key)
-        filtered_mixture_spec.append((d_name, d_weight, robot_type))
 
-    dataset_mixture = []
-    for d_name, d_weight, robot_type in filtered_mixture_spec:
-        repo_id = os.path.join(data_root_dir, d_name)
-        ds_meta = LeRobotDatasetMetadata(repo_id)
+def _load_lerobot_classes():
+    """Import the official v3 reader lazily so other dataset modes stay usable."""
 
-        observation_keys = []
-        for k in ds_meta.features.keys():
-            if "observation" in k:
-                observation_keys.append(k)
-        delta_timestamps = {
-            # loads 64 action vectors: current frame, 1 frame in the future, 2 frames, ... 63 frames in the future
-            "action": [t / ds_meta.fps for t in range(action_horizon)],
-        }
-        for k in observation_keys:
-            delta_timestamps[k] = [t / ds_meta.fps for t in range(action_horizon+1)]
-        dataset_mixture.append(
-            LeRobotDataset(
-                repo_id,
-                delta_timestamps=delta_timestamps,
+    try:
+        from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
+    except ImportError as exc:
+        raise ImportError(
+            "LIBERO v3 loading requires the official LeRobot package. "
+            "Install `lerobot==0.4.3` in the training environment."
+        ) from exc
+
+    try:
+        installed_version = version("lerobot")
+    except PackageNotFoundError:
+        installed_version = "unknown"
+    return LeRobotDataset, LeRobotDatasetMetadata, installed_version
+
+
+def _as_vector(values: Any, *, name: str, expected_dim: int) -> np.ndarray:
+    array = np.asarray(values, dtype=np.float64)
+    if array.shape != (expected_dim,):
+        raise ValueError(f"{name} must have shape ({expected_dim},), got {array.shape}.")
+    return array
+
+
+def _convert_libero_gripper_to_open(action: torch.Tensor) -> torch.Tensor:
+    """Convert LIBERO env gripper {-1=open,+1=close} to starVLA {1=open,0=close}."""
+
+    converted = action.clone()
+    converted[..., -1] = (1.0 - converted[..., -1]) * 0.5
+    return converted
+
+
+def _convert_gripper_statistics(stats: dict[str, Any]) -> dict[str, Any]:
+    """Apply y=(1-x)/2 to the last action dimension of LeRobot statistics."""
+
+    converted = deepcopy(stats)
+    vector_keys = ("mean", "std", "min", "max", "q01", "q99")
+    old = {
+        key: _as_vector(stats[key], name=f"action.{key}", expected_dim=7)
+        for key in vector_keys
+        if key in stats
+    }
+
+    for key in ("mean", "min", "max", "q01", "q99"):
+        if key in converted:
+            converted[key] = old[key].copy()
+    if "std" in converted:
+        converted["std"] = old["std"].copy()
+
+    if "mean" in converted:
+        converted["mean"][-1] = (1.0 - old["mean"][-1]) * 0.5
+    if "std" in converted:
+        converted["std"][-1] = old["std"][-1] * 0.5
+    if "min" in converted and "max" in converted:
+        converted["min"][-1] = (1.0 - old["max"][-1]) * 0.5
+        converted["max"][-1] = (1.0 - old["min"][-1]) * 0.5
+    if "q01" in converted and "q99" in converted:
+        converted["q01"][-1] = (1.0 - old["q99"][-1]) * 0.5
+        converted["q99"][-1] = (1.0 - old["q01"][-1]) * 0.5
+
+    return {
+        key: value.tolist() if isinstance(value, np.ndarray) else value
+        for key, value in converted.items()
+        if key in {"mean", "std", "min", "max", "q01", "q99"}
+    }
+
+
+class LeRobotV3VLADataset(Dataset):
+    """Decode one combined LeRobot v3 LIBERO repository with official APIs."""
+
+    def __init__(self, data_cfg: Any) -> None:
+        LeRobotDataset, LeRobotDatasetMetadata, installed_version = _load_lerobot_classes()
+
+        self.root = Path(data_cfg.data_root_dir)
+        self.repo_id = str(data_cfg.get("repo_id", "HuggingFaceVLA/libero"))
+        self.image_keys = list(data_cfg.img_keys)
+        self.state_key = str(data_cfg.get("state_key", "observation.state"))
+        self.action_key = str(data_cfg.get("action_key", "action"))
+        self.task_key = str(data_cfg.get("task_key", "task"))
+        self.action_horizon = int(data_cfg.action_horizon)
+        self.video_horizon = int(data_cfg.video_horizon)
+        self.resolution_size = int(data_cfg.get("resolution_size", 224))
+        self.video_resolution_size = int(data_cfg.get("video_resolution_size", 256))
+        self.with_state = bool(data_cfg.get("with_state", True))
+        self.robot_tag = str(data_cfg.get("robot_tag", "franka"))
+
+        if not self.root.is_dir():
+            raise FileNotFoundError(f"LeRobot v3 root does not exist: {self.root}")
+        if len(self.image_keys) != 2:
+            raise ValueError(
+                "The released VLA-JEPA checkpoints require exactly two camera views; "
+                f"got {self.image_keys}."
             )
+
+        self.meta = LeRobotDatasetMetadata(repo_id=self.repo_id, root=self.root)
+        required_keys = set(self.image_keys + [self.action_key])
+        if self.with_state:
+            required_keys.add(self.state_key)
+        missing = sorted(required_keys.difference(self.meta.features))
+        if missing:
+            raise KeyError(f"Missing required LeRobot v3 features: {missing}")
+        if int(self.meta.fps) <= 0:
+            raise ValueError(f"Dataset FPS must be positive, got {self.meta.fps}.")
+
+        # This follows LeRobot's VLA-JEPA config exactly: t..t+7 observations
+        # and t..t+6 actions. LeRobot handles episode-edge clamping and emits
+        # `<feature>_is_pad` masks for out-of-range positions.
+        delta_timestamps = {
+            self.action_key: [step / self.meta.fps for step in range(self.action_horizon)]
+        }
+        for key in self.image_keys:
+            delta_timestamps[key] = [step / self.meta.fps for step in range(self.video_horizon)]
+        if self.with_state:
+            delta_timestamps[self.state_key] = [
+                step / self.meta.fps for step in range(self.video_horizon)
+            ]
+
+        self.dataset = LeRobotDataset(
+            repo_id=self.repo_id,
+            root=self.root,
+            delta_timestamps=delta_timestamps,
+            video_backend=str(data_cfg.get("video_backend", "pyav")),
         )
-    #[print(ds.num_episodes, ds.num_frames, i) for i, ds in enumerate(dataset_mixture)]
-    return MixtureDataset(dataset_mixture)
-    
+        self.lerobot_version = installed_version
+
+        action_stats = self.meta.stats.get(self.action_key)
+        if action_stats is None:
+            raise KeyError(f"Missing action statistics for {self.action_key!r}.")
+        self._action_min = torch.as_tensor(action_stats["min"], dtype=torch.float32)
+        self._action_max = torch.as_tensor(action_stats["max"], dtype=torch.float32)
+        if tuple(self._action_min.shape) != (7,) or tuple(self._action_max.shape) != (7,):
+            raise ValueError(
+                "VLA-JEPA LIBERO expects 7-D action statistics, got "
+                f"{tuple(self._action_min.shape)} and {tuple(self._action_max.shape)}."
+            )
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+    def _normalize_action(self, sample: dict[str, Any]) -> np.ndarray:
+        action = torch.as_tensor(sample[self.action_key], dtype=torch.float32)
+        if tuple(action.shape) != (self.action_horizon, 7):
+            raise ValueError(
+                f"Expected action [{self.action_horizon},7], got {tuple(action.shape)}."
+            )
+
+        action = _convert_libero_gripper_to_open(action)
+        action_is_pad = sample.get(f"{self.action_key}_is_pad")
+        if action_is_pad is not None:
+            action[torch.as_tensor(action_is_pad, dtype=torch.bool)] = 0.0
+
+        # Match the original starVLA LIBERO transform: min-max only the six
+        # continuous dimensions; keep open_gripper in identity [0,1] space.
+        low = self._action_min[:6]
+        high = self._action_max[:6]
+        scale = high - low
+        if torch.any(scale == 0):
+            raise ValueError("Continuous LIBERO action statistics contain a zero range.")
+        action[:, :6] = 2.0 * (action[:, :6] - low) / scale - 1.0
+        action[:, 6] = action[:, 6].clamp(0.0, 1.0)
+        return action.numpy().astype(np.float32, copy=False)
+
+    def _convert_video(self, frames: Any, *, key: str) -> tuple[Image.Image, np.ndarray]:
+        video = torch.as_tensor(frames, dtype=torch.float32)
+        if video.ndim != 4 or video.shape[0] != self.video_horizon or video.shape[1] != 3:
+            raise ValueError(
+                f"{key} must be [{self.video_horizon},3,H,W], got {tuple(video.shape)}."
+            )
+        video = F.interpolate(
+            video,
+            size=(self.video_resolution_size, self.video_resolution_size),
+            mode="bilinear",
+            align_corners=False,
+            antialias=True,
+        )
+        video_uint8 = (
+            video.clamp(0.0, 1.0)
+            .mul(255.0)
+            .round()
+            .to(torch.uint8)
+            .permute(0, 2, 3, 1)
+            .contiguous()
+            .numpy()
+        )
+        current = Image.fromarray(video_uint8[0]).resize(
+            (self.resolution_size, self.resolution_size),
+            resample=Image.Resampling.BILINEAR,
+        )
+        return current, video_uint8
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        sample = self.dataset[index]
+        images: list[Image.Image] = []
+        videos: list[np.ndarray] = []
+        for key in self.image_keys:
+            current, video = self._convert_video(sample[key], key=key)
+            images.append(current)
+            videos.append(video)
+
+        example: dict[str, Any] = {
+            "image": images,
+            "video": np.stack(videos, axis=0),
+            "lang": str(sample[self.task_key]),
+            "action": self._normalize_action(sample),
+            "video_fps": float(self.meta.fps),
+        }
+        if self.with_state:
+            state = torch.as_tensor(sample[self.state_key], dtype=torch.float32)
+            if state.ndim != 2 or state.shape[0] != self.video_horizon:
+                raise ValueError(
+                    f"{self.state_key} must be [{self.video_horizon},D], got {tuple(state.shape)}."
+                )
+            # Use the current state only. Future states are loaded solely because
+            # LeRobot applies one observation window to all observation keys.
+            example["state"] = state[:1].numpy().astype(np.float32, copy=False)
+        return example
+
+    @property
+    def dataset_statistics(self) -> dict[str, Any]:
+        """Return the checkpoint-side statistics format used by starVLA eval."""
+
+        action_stats = _convert_gripper_statistics(self.meta.stats[self.action_key])
+        action_stats["mask"] = [True, True, True, True, True, True, False]
+        tag_stats: dict[str, Any] = {
+            "action": action_stats,
+            "num_transitions": int(self.meta.total_frames),
+            "num_trajectories": int(self.meta.total_episodes),
+        }
+        if self.with_state:
+            state_stats = self.meta.stats.get(self.state_key)
+            if state_stats is None:
+                raise KeyError(f"Missing state statistics for {self.state_key!r}.")
+            tag_stats["state"] = {
+                key: list(value)
+                for key, value in state_stats.items()
+                if key in {"mean", "std", "min", "max", "q01", "q99"}
+            }
+        return {self.robot_tag: tag_stats}
+
+
+def get_lerobot_v3_datasets(data_cfg: Any) -> LeRobotV3VLADataset:
+    return LeRobotV3VLADataset(data_cfg)
