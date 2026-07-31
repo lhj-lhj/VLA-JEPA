@@ -1,12 +1,15 @@
-"""Thin adapter from an official LeRobot v3 dataset to starVLA examples.
+"""Thin adapters from official LeRobot v3 datasets to starVLA examples.
 
 LeRobot owns the v3 metadata, parquet/image decoding, episode boundary
 clamping, delta timestamps, task lookup, and padding masks.  This file only
-adapts one decoded sample to the list-of-dicts format consumed by VLA_JEPA.
+adapts decoded LIBERO or DROID samples to the list-of-dicts format consumed
+by VLA_JEPA.
 """
 
 from __future__ import annotations
 
+import json
+import random
 from copy import deepcopy
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
@@ -91,6 +94,42 @@ def _convert_gripper_statistics(stats: dict[str, Any]) -> dict[str, Any]:
         for key, value in converted.items()
         if key in {"mean", "std", "min", "max", "q01", "q99"}
     }
+
+
+def _convert_video_frames(
+    frames: Any,
+    *,
+    horizon: int,
+    current_size: int,
+    video_size: int,
+    key: str,
+) -> tuple[Image.Image, np.ndarray]:
+    """Resize official LeRobot CHW frames for the existing starVLA contract."""
+
+    video = torch.as_tensor(frames, dtype=torch.float32)
+    if video.ndim != 4 or tuple(video.shape[:2]) != (horizon, 3):
+        raise ValueError(f"{key} must be [{horizon},3,H,W], got {tuple(video.shape)}.")
+    video = F.interpolate(
+        video,
+        size=(video_size, video_size),
+        mode="bilinear",
+        align_corners=False,
+        antialias=True,
+    )
+    video_uint8 = (
+        video.clamp(0.0, 1.0)
+        .mul(255.0)
+        .round()
+        .to(torch.uint8)
+        .permute(0, 2, 3, 1)
+        .contiguous()
+        .numpy()
+    )
+    current = Image.fromarray(video_uint8[0]).resize(
+        (current_size, current_size),
+        resample=Image.Resampling.BILINEAR,
+    )
+    return current, video_uint8
 
 
 class LeRobotV3VLADataset(Dataset):
@@ -189,32 +228,13 @@ class LeRobotV3VLADataset(Dataset):
         return action.numpy().astype(np.float32, copy=False)
 
     def _convert_video(self, frames: Any, *, key: str) -> tuple[Image.Image, np.ndarray]:
-        video = torch.as_tensor(frames, dtype=torch.float32)
-        if video.ndim != 4 or video.shape[0] != self.video_horizon or video.shape[1] != 3:
-            raise ValueError(
-                f"{key} must be [{self.video_horizon},3,H,W], got {tuple(video.shape)}."
-            )
-        video = F.interpolate(
-            video,
-            size=(self.video_resolution_size, self.video_resolution_size),
-            mode="bilinear",
-            align_corners=False,
-            antialias=True,
+        return _convert_video_frames(
+            frames,
+            horizon=self.video_horizon,
+            current_size=self.resolution_size,
+            video_size=self.video_resolution_size,
+            key=key,
         )
-        video_uint8 = (
-            video.clamp(0.0, 1.0)
-            .mul(255.0)
-            .round()
-            .to(torch.uint8)
-            .permute(0, 2, 3, 1)
-            .contiguous()
-            .numpy()
-        )
-        current = Image.fromarray(video_uint8[0]).resize(
-            (self.resolution_size, self.resolution_size),
-            resample=Image.Resampling.BILINEAR,
-        )
-        return current, video_uint8
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         sample = self.dataset[index]
@@ -266,5 +286,229 @@ class LeRobotV3VLADataset(Dataset):
         return {self.robot_tag: tag_stats}
 
 
-def get_lerobot_v3_datasets(data_cfg: Any) -> LeRobotV3VLADataset:
-    return LeRobotV3VLADataset(data_cfg)
+class LeRobotV3DROIDDataset(Dataset):
+    """Thin starVLA adapter around official ``lerobot/droid_1.0.1`` decoding."""
+
+    def __init__(self, data_cfg: Any) -> None:
+        LeRobotDataset, LeRobotDatasetMetadata, installed_version = _load_lerobot_classes()
+
+        self.root = Path(data_cfg.data_root_dir)
+        self.repo_id = str(data_cfg.get("repo_id", "lerobot/droid_1.0.1"))
+        self.image_keys = list(data_cfg.img_keys)
+        self.world_model_image_keys = list(data_cfg.world_model_image_keys)
+        self.continuous_action_key = str(
+            data_cfg.get("continuous_action_key", "action.cartesian_velocity")
+        )
+        self.gripper_action_key = str(
+            data_cfg.get("gripper_action_key", "action.gripper_position")
+        )
+        self.language_keys = list(
+            data_cfg.get(
+                "language_keys",
+                [
+                    "language_instruction",
+                    "language_instruction_2",
+                    "language_instruction_3",
+                ],
+            )
+        )
+        self.action_horizon = int(data_cfg.action_horizon)
+        self.video_horizon = int(data_cfg.video_horizon)
+        self.resolution_size = int(data_cfg.get("resolution_size", 224))
+        self.video_resolution_size = int(data_cfg.get("video_resolution_size", 256))
+        self.gripper_threshold = float(data_cfg.get("gripper_threshold", 0.5))
+        self.robot_tag = str(data_cfg.get("robot_tag", "franka"))
+        episode_indices_path = Path(data_cfg.success_episode_indices_path)
+
+        if not self.root.is_dir():
+            raise FileNotFoundError(f"LeRobot v3 root does not exist: {self.root}")
+        if not episode_indices_path.is_file():
+            raise FileNotFoundError(
+                f"DROID success episode manifest does not exist: {episode_indices_path}"
+            )
+        if bool(data_cfg.get("with_state", False)):
+            raise ValueError("VLA-JEPA DROID pretraining requires with_state=false.")
+        if len(self.world_model_image_keys) != 2:
+            raise ValueError("VLA-JEPA requires exactly two world-model views.")
+        if not set(self.world_model_image_keys).issubset(self.image_keys):
+            raise ValueError("world_model_image_keys must be a subset of img_keys.")
+
+        self.meta = LeRobotDatasetMetadata(repo_id=self.repo_id, root=self.root)
+        action_keys = [self.continuous_action_key, self.gripper_action_key]
+        required_keys = set(self.image_keys + action_keys + self.language_keys)
+        missing = sorted(required_keys.difference(self.meta.features))
+        if missing:
+            raise KeyError(f"Missing required DROID v3 features: {missing}")
+
+        manifest = json.loads(episode_indices_path.read_text(encoding="utf-8"))
+        self.episode_indices = [int(index) for index in manifest["episode_indices"]]
+        if not self.episode_indices or len(self.episode_indices) != len(
+            set(self.episode_indices)
+        ):
+            raise ValueError("DROID success episode manifest is empty or has duplicates.")
+        if min(self.episode_indices) < 0 or max(self.episode_indices) >= self.meta.total_episodes:
+            raise ValueError("DROID success episode manifest contains invalid indices.")
+        episode_index = np.asarray(self.meta.episodes["episode_index"], dtype=np.int64)
+        episode_start = np.asarray(
+            self.meta.episodes["dataset_from_index"], dtype=np.int64
+        )
+        episode_length = np.asarray(self.meta.episodes["length"], dtype=np.int64)
+        start_by_episode = np.empty(self.meta.total_episodes, dtype=np.int64)
+        length_by_episode = np.empty(self.meta.total_episodes, dtype=np.int64)
+        start_by_episode[episode_index] = episode_start
+        length_by_episode[episode_index] = episode_length
+        self._selected_starts = start_by_episode[self.episode_indices]
+        selected_lengths = length_by_episode[self.episode_indices]
+        self._selected_ends = np.cumsum(selected_lengths, dtype=np.int64)
+        self.num_selected_transitions = int(self._selected_ends[-1])
+
+        # The official reader owns episode clamping, padding masks, and decoding.
+        delta_timestamps = {
+            key: [step / self.meta.fps for step in range(self.action_horizon)]
+            for key in action_keys
+        }
+        delta_timestamps.update(
+            {
+                key: [step / self.meta.fps for step in range(self.video_horizon)]
+                for key in self.image_keys
+            }
+        )
+
+        self.dataset = LeRobotDataset(
+            repo_id=self.repo_id,
+            root=self.root,
+            delta_timestamps=delta_timestamps,
+            video_backend=str(data_cfg.get("video_backend", "pyav")),
+        )
+        self.lerobot_version = installed_version
+
+        continuous_stats = self.meta.stats.get(self.continuous_action_key)
+        gripper_stats = self.meta.stats.get(self.gripper_action_key)
+        if continuous_stats is None or gripper_stats is None:
+            raise KeyError("DROID v3 action statistics are incomplete.")
+        self._continuous_stats = continuous_stats
+        self._gripper_stats = gripper_stats
+        self._continuous_min = torch.as_tensor(continuous_stats["min"], dtype=torch.float32)
+        self._continuous_max = torch.as_tensor(continuous_stats["max"], dtype=torch.float32)
+
+    def __len__(self) -> int:
+        return self.num_selected_transitions
+
+    def _global_frame_index(self, index: int) -> int:
+        if index < 0:
+            index += len(self)
+        if index < 0 or index >= len(self):
+            raise IndexError(index)
+        episode_position = int(np.searchsorted(self._selected_ends, index, side="right"))
+        previous_end = (
+            0 if episode_position == 0 else int(self._selected_ends[episode_position - 1])
+        )
+        return int(self._selected_starts[episode_position] + index - previous_end)
+
+    def _normalize_action(self, sample: dict[str, Any]) -> np.ndarray:
+        continuous = torch.as_tensor(sample[self.continuous_action_key], dtype=torch.float32)
+        gripper = torch.as_tensor(sample[self.gripper_action_key], dtype=torch.float32)
+        if gripper.ndim == 1:
+            gripper = gripper.unsqueeze(-1)
+        if tuple(continuous.shape) != (self.action_horizon, 6) or tuple(
+            gripper.shape
+        ) != (self.action_horizon, 1):
+            raise ValueError(
+                "Expected DROID actions "
+                f"[{self.action_horizon},6]+[{self.action_horizon},1], got "
+                f"{tuple(continuous.shape)}+{tuple(gripper.shape)}."
+            )
+
+        scale = self._continuous_max - self._continuous_min
+        if torch.any(scale == 0):
+            raise ValueError("DROID Cartesian action statistics contain a zero range.")
+        continuous = 2.0 * (continuous - self._continuous_min) / scale - 1.0
+        # Public DROID stores larger gripper positions as open; starVLA uses
+        # binary closedness, matching the released pretrain checkpoint.
+        action = torch.cat(
+            [continuous, (gripper <= self.gripper_threshold).float()], dim=-1
+        )
+
+        is_pad = torch.zeros(self.action_horizon, dtype=torch.bool)
+        for key in (self.continuous_action_key, self.gripper_action_key):
+            if f"{key}_is_pad" in sample:
+                is_pad |= torch.as_tensor(sample[f"{key}_is_pad"], dtype=torch.bool).reshape(-1)
+        action[is_pad] = 0.0
+        return action.numpy().astype(np.float32, copy=False)
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        sample = self.dataset[self._global_frame_index(index)]
+        language_candidates = [
+            value
+            for key in self.language_keys
+            if (value := str(sample[key]).strip())
+        ]
+        if not language_candidates:
+            raise RuntimeError(
+                "Success-with-language manifest yielded an empty-language DROID sample."
+            )
+        # DROID provides up to three paraphrases per successful episode.
+        # Resample one on every access so repeated frames/epochs augment language.
+        language = random.choice(language_candidates)
+        converted = {
+            key: _convert_video_frames(
+                sample[key],
+                horizon=self.video_horizon,
+                current_size=self.resolution_size,
+                video_size=self.video_resolution_size,
+                key=key,
+            )
+            for key in self.image_keys
+        }
+
+        return {
+            "image": [converted[key][0] for key in self.image_keys],
+            "video": np.stack(
+                [converted[key][1] for key in self.world_model_image_keys],
+                axis=0,
+            ),
+            "lang": language,
+            "action": self._normalize_action(sample),
+            "video_fps": float(self.meta.fps),
+        }
+
+    @property
+    def dataset_statistics(self) -> dict[str, Any]:
+        low = np.asarray(self._continuous_stats["min"], dtype=np.float64)
+        high = np.asarray(self._continuous_stats["max"], dtype=np.float64)
+        scale = high - low
+        normalized = {
+            key: (2.0 * (np.asarray(self._continuous_stats[key]) - low) / scale - 1.0)
+            for key in ("mean", "q01", "q99")
+        }
+        normalized["std"] = 2.0 * np.asarray(self._continuous_stats["std"]) / scale
+        normalized["min"], normalized["max"] = np.full(6, -1.0), np.full(6, 1.0)
+        gripper = {
+            "mean": 1.0 - float(self._gripper_stats["mean"][0]),
+            "std": float(self._gripper_stats["std"][0]),
+            "min": 0.0,
+            "max": 1.0,
+            "q01": 1.0 - float(self._gripper_stats["q99"][0]),
+            "q99": 1.0 - float(self._gripper_stats["q01"][0]),
+        }
+        action_stats = {
+            key: np.append(normalized[key], gripper[key]).tolist()
+            for key in ("mean", "std", "min", "max", "q01", "q99")
+        }
+        action_stats["mask"] = [True] * 6 + [False]
+        return {
+            self.robot_tag: {
+                "action": action_stats,
+                "num_transitions": self.num_selected_transitions,
+                "num_trajectories": len(self.episode_indices),
+            }
+        }
+
+
+def get_lerobot_v3_datasets(data_cfg: Any) -> Dataset:
+    profile = str(data_cfg.get("profile", "libero")).lower()
+    if profile == "libero":
+        return LeRobotV3VLADataset(data_cfg)
+    if profile == "droid":
+        return LeRobotV3DROIDDataset(data_cfg)
+    raise ValueError(f"Unsupported LeRobot v3 profile: {profile!r}")
