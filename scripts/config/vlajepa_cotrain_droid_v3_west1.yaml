@@ -87,7 +87,7 @@ datasets:
     CoT_prompt: "Your task is {instruction}. Infer the temporal dynamics from the current observation {actions} and produce the corresponding policy actions {e_actions}."
     resolution_size: 224
     video_resolution_size: 256
-    per_device_batch_size: 16
+    per_device_batch_size: 32
     num_workers: 4
     load_all_data_for_training: true
     with_state: false
@@ -99,7 +99,7 @@ datasets:
     extensions: [parquet]
     resolution_size: 224
     video_resolution_size: 256
-    per_device_batch_size: 16
+    per_device_batch_size: 32
 
 trainer:
   epochs: 100
