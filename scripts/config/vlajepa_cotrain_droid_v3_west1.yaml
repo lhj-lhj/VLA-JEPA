@@ -47,8 +47,8 @@ framework:
     depth: 12
     num_heads: 8
     special_action_token: <|action_{}|>
-    predictor_variant: original
-    num_action_tokens_per_timestep: 8
+    predictor_variant: f0_repeat_noncausal
+    num_action_tokens_per_timestep: 6
     embodied_action_token: <|embodied_action|>
     num_embodied_action_tokens_per_instruction: 32
     num_frames: 8
@@ -95,9 +95,7 @@ datasets:
     dataset_py: video_datasets
     video_dir: /workspace/datasets/something_something_v2/data
     text_file: /workspace/datasets/something_something_v2/labels
-    # Human-video dynamics pretraining is task-agnostic; SSV2 labels are not
-    # exposed as task instructions on this route.
-    CoT_prompt: "Infer the temporal dynamics of future frames {actions}."
+    CoT_prompt: "Your task is {instruction}. Infer the temporal dynamics of future frames {actions}."
     extensions: [parquet]
     resolution_size: 224
     video_resolution_size: 256
