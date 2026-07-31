@@ -429,8 +429,10 @@ class VLAMTrainer(TrainerUtils):
             "normal_code_wm_l1_metric",
             "zero_code_wm_l1_metric",
         }
-        logging_frequency = int(self.config.trainer.logging_frequency)
-        compute_zero_code_metric = (self.completed_steps + 1) % logging_frequency == 0
+        zero_code_metrics_frequency = int(getattr(self.config.trainer, "zero_code_metrics_frequency", 100))
+        compute_zero_code_metric = (
+            zero_code_metrics_frequency > 0 and (self.completed_steps + 1) % zero_code_metrics_frequency == 0
+        )
 
         with self.accelerator.accumulate(self.model):
             self.optimizer.zero_grad()
