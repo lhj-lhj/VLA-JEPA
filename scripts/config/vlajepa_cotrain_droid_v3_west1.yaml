@@ -83,6 +83,16 @@ datasets:
     action_horizon: 7
     video_horizon: 8
     video_backend: pyav
+    # LeRobot builds float32 timestamps for long concatenated DROID videos.
+    # At ~1700 s one float32 ULP exceeds its 1e-4 default, so allow 1 ms while
+    # remaining far below DROID's 66.7 ms frame interval.
+    video_tolerance_s: 0.001
+    # Only recognized media-decode failures are quarantined. Each worker writes
+    # an append-only JSONL shard; later runs load all shards and deterministically
+    # replace those stable global frame indices before attempting to decode them.
+    decode_max_retries: 8
+    decode_replacement_stride: 104729
+    decode_error_log_dir: /workspace/hongjia/Unified_Model/logs/droid_1.0.1_decode_errors
     gripper_threshold: 0.5
     CoT_prompt: "Your task is {instruction}. Infer the temporal dynamics from the current observation {actions} and produce the corresponding policy actions {e_actions}."
     resolution_size: 224

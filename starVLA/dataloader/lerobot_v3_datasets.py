@@ -9,8 +9,11 @@ by VLA_JEPA.
 from __future__ import annotations
 
 import json
+import logging
+import os
 import random
 from copy import deepcopy
+from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
@@ -19,7 +22,40 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, get_worker_info
+
+
+_LEROBOT_TIMESTAMP_TOLERANCE_ERROR = (
+    "One or several query timestamps unexpectedly violate the tolerance"
+)
+_VIDEO_DECODE_ERROR_MARKERS = (
+    "could not decode video",
+    "failed to decode video",
+    "failed to open video",
+    "invalid data found when processing input",
+    "moov atom not found",
+    "no valid frames",
+    "unable to decode video",
+)
+
+
+def _is_lerobot_video_decode_error(error: Exception) -> bool:
+    """Recognize media failures without swallowing unrelated loader assertions."""
+
+    message = str(error)
+    if isinstance(error, AssertionError):
+        return _LEROBOT_TIMESTAMP_TOLERANCE_ERROR in message
+    if type(error).__module__.split(".", maxsplit=1)[0] == "av":
+        return True
+    lowered = message.lower()
+    return any(marker in lowered for marker in _VIDEO_DECODE_ERROR_MARKERS)
+
+
+def _video_path_from_decode_error(error: Exception) -> str | None:
+    for line in str(error).splitlines():
+        if line.startswith("video: "):
+            return line.removeprefix("video: ").strip()
+    return None
 
 
 def collate_fn(batch: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -318,6 +354,15 @@ class LeRobotV3DROIDDataset(Dataset):
         self.video_resolution_size = int(data_cfg.get("video_resolution_size", 256))
         self.gripper_threshold = float(data_cfg.get("gripper_threshold", 0.5))
         self.robot_tag = str(data_cfg.get("robot_tag", "franka"))
+        self.video_tolerance_s = float(data_cfg.get("video_tolerance_s", 1.0e-3))
+        self.decode_max_retries = int(data_cfg.get("decode_max_retries", 8))
+        self.decode_replacement_stride = int(
+            data_cfg.get("decode_replacement_stride", 104729)
+        )
+        decode_error_log_dir = data_cfg.get("decode_error_log_dir")
+        self.decode_error_log_dir = (
+            Path(decode_error_log_dir) if decode_error_log_dir else None
+        )
         episode_indices_path = Path(data_cfg.success_episode_indices_path)
 
         if not self.root.is_dir():
@@ -332,6 +377,14 @@ class LeRobotV3DROIDDataset(Dataset):
             raise ValueError("VLA-JEPA requires exactly two world-model views.")
         if not set(self.world_model_image_keys).issubset(self.image_keys):
             raise ValueError("world_model_image_keys must be a subset of img_keys.")
+        if self.video_tolerance_s <= 0:
+            raise ValueError("video_tolerance_s must be positive.")
+        if self.decode_max_retries < 0:
+            raise ValueError("decode_max_retries must be non-negative.")
+        if self.decode_replacement_stride <= 0:
+            raise ValueError("decode_replacement_stride must be positive.")
+        if self.decode_error_log_dir is not None:
+            self.decode_error_log_dir.mkdir(parents=True, exist_ok=True)
 
         self.meta = LeRobotDatasetMetadata(repo_id=self.repo_id, root=self.root)
         action_keys = [self.continuous_action_key, self.gripper_action_key]
@@ -361,6 +414,9 @@ class LeRobotV3DROIDDataset(Dataset):
         selected_lengths = length_by_episode[self.episode_indices]
         self._selected_ends = np.cumsum(selected_lengths, dtype=np.int64)
         self.num_selected_transitions = int(self._selected_ends[-1])
+        self._quarantined_global_frame_indices = (
+            self._load_quarantined_global_frame_indices()
+        )
 
         # The official reader owns episode clamping, padding masks, and decoding.
         delta_timestamps = {
@@ -378,6 +434,7 @@ class LeRobotV3DROIDDataset(Dataset):
             repo_id=self.repo_id,
             root=self.root,
             delta_timestamps=delta_timestamps,
+            tolerance_s=self.video_tolerance_s,
             video_backend=str(data_cfg.get("video_backend", "pyav")),
         )
         self.lerobot_version = installed_version
@@ -394,7 +451,7 @@ class LeRobotV3DROIDDataset(Dataset):
     def __len__(self) -> int:
         return self.num_selected_transitions
 
-    def _global_frame_index(self, index: int) -> int:
+    def _sample_coordinates(self, index: int) -> tuple[int, int, int]:
         if index < 0:
             index += len(self)
         if index < 0 or index >= len(self):
@@ -403,7 +460,141 @@ class LeRobotV3DROIDDataset(Dataset):
         previous_end = (
             0 if episode_position == 0 else int(self._selected_ends[episode_position - 1])
         )
-        return int(self._selected_starts[episode_position] + index - previous_end)
+        episode_frame_index = index - previous_end
+        global_frame_index = int(
+            self._selected_starts[episode_position] + episode_frame_index
+        )
+        return (
+            global_frame_index,
+            int(self.episode_indices[episode_position]),
+            int(episode_frame_index),
+        )
+
+    def _global_frame_index(self, index: int) -> int:
+        return self._sample_coordinates(index)[0]
+
+    def _load_quarantined_global_frame_indices(self) -> set[int]:
+        quarantined: set[int] = set()
+        if self.decode_error_log_dir is None:
+            return quarantined
+        for log_path in sorted(self.decode_error_log_dir.glob("*.jsonl")):
+            with log_path.open(encoding="utf-8") as handle:
+                for line_number, line in enumerate(handle, start=1):
+                    try:
+                        record = json.loads(line)
+                        if (
+                            record.get("repo_id") == self.repo_id
+                            and record.get("dataset_root") == str(self.root)
+                        ):
+                            quarantined.add(int(record["global_frame_index"]))
+                    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                        logging.warning(
+                            "Ignoring malformed DROID decode quarantine record %s:%d",
+                            log_path,
+                            line_number,
+                        )
+        if quarantined:
+            logging.info(
+                "Loaded %d quarantined DROID global frame indices from %s",
+                len(quarantined),
+                self.decode_error_log_dir,
+            )
+        return quarantined
+
+    def _record_decode_error(
+        self,
+        *,
+        dataset_index: int,
+        global_frame_index: int,
+        episode_index: int,
+        episode_frame_index: int,
+        error: Exception,
+    ) -> None:
+        self._quarantined_global_frame_indices.add(global_frame_index)
+        if self.decode_error_log_dir is None:
+            return
+
+        worker = get_worker_info()
+        rank = os.environ.get("RANK", "0")
+        worker_id = "main" if worker is None else str(worker.id)
+        log_path = self.decode_error_log_dir / (
+            f"rank-{rank}_worker-{worker_id}_pid-{os.getpid()}.jsonl"
+        )
+        record = {
+            "recorded_at_utc": datetime.now(timezone.utc).isoformat(),
+            "repo_id": self.repo_id,
+            "dataset_root": str(self.root),
+            "dataset_index": dataset_index,
+            "global_frame_index": global_frame_index,
+            "episode_index": episode_index,
+            "episode_frame_index": episode_frame_index,
+            "video_path": _video_path_from_decode_error(error),
+            "error_type": f"{type(error).__module__}.{type(error).__name__}",
+            "error": str(error),
+        }
+        payload = (json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8")
+        file_descriptor = os.open(
+            log_path,
+            os.O_APPEND | os.O_CREAT | os.O_WRONLY,
+            0o644,
+        )
+        try:
+            remaining = memoryview(payload)
+            while remaining:
+                remaining = remaining[os.write(file_descriptor, remaining) :]
+        finally:
+            os.close(file_descriptor)
+        logging.warning(
+            "Quarantined DROID dataset index %d (global=%d, episode=%d, frame=%d) "
+            "after %s; a deterministic replacement will be used.",
+            dataset_index,
+            global_frame_index,
+            episode_index,
+            episode_frame_index,
+            type(error).__name__,
+        )
+
+    def _decode_with_deterministic_replacement(self, index: int) -> dict[str, Any]:
+        if index < 0:
+            index += len(self)
+        if index < 0 or index >= len(self):
+            raise IndexError(index)
+
+        last_decode_error: Exception | None = None
+        for attempt in range(self.decode_max_retries + 1):
+            candidate_index = (
+                index + attempt * self.decode_replacement_stride
+            ) % len(self)
+            (
+                global_frame_index,
+                episode_index,
+                episode_frame_index,
+            ) = self._sample_coordinates(candidate_index)
+            if global_frame_index in self._quarantined_global_frame_indices:
+                continue
+            try:
+                return self.dataset[global_frame_index]
+            except Exception as error:
+                if not _is_lerobot_video_decode_error(error):
+                    raise
+                self._record_decode_error(
+                    dataset_index=candidate_index,
+                    global_frame_index=global_frame_index,
+                    episode_index=episode_index,
+                    episode_frame_index=episode_frame_index,
+                    error=error,
+                )
+                last_decode_error = error
+
+        message = (
+            f"Unable to decode DROID dataset index {index} after "
+            f"{self.decode_max_retries + 1} deterministic candidates."
+        )
+        if last_decode_error is not None:
+            raise RuntimeError(message) from last_decode_error
+        raise RuntimeError(
+            message + " Every candidate was already present in the decode quarantine."
+        )
 
     def _normalize_action(self, sample: dict[str, Any]) -> np.ndarray:
         continuous = torch.as_tensor(sample[self.continuous_action_key], dtype=torch.float32)
@@ -437,7 +628,7 @@ class LeRobotV3DROIDDataset(Dataset):
         return action.numpy().astype(np.float32, copy=False)
 
     def __getitem__(self, index: int) -> dict[str, Any]:
-        sample = self.dataset[self._global_frame_index(index)]
+        sample = self._decode_with_deterministic_replacement(index)
         language_candidates = [
             value
             for key in self.language_keys
