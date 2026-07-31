@@ -106,7 +106,9 @@ trainer:
   max_train_steps: 50000
   num_warmup_steps: 5000
   save_interval: 10000
-  eval_interval: 100
+  # The legacy inline action check consumes training batches and is not a
+  # held-out evaluation. Route sufficiency diagnostics are logged every 10 steps.
+  eval_interval: 0
   learning_rate:
     base: 3.0e-05
     qwen_vl_interface: 1.0e-05
@@ -117,6 +119,8 @@ trainer:
   freeze_modules: ''
   loss_scale:
     vla: 1.0
+    # Keep SSV2 useful as representation supervision without letting its
+    # world-model loss dominate the robot/action route.
     vlm: 0.1
   max_grad_norm: 1.0
   warmup_ratio: 0.1

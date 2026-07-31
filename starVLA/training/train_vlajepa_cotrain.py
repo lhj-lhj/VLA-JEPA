@@ -1,5 +1,5 @@
 # Copyright 2025 starVLA community. All rights reserved.
-# Licensed under the MIT License, Version 1.0 (the "License"); 
+# Licensed under the MIT License, Version 1.0 (the "License");
 # Implemented by [Jinhui YE / HKUST University] in [2025].
 
 
@@ -11,6 +11,7 @@ Conventions:
 3. Put each training strategy in its own `trainer_*.py` file (avoid large if‑else chains).  
 """
 import warnings
+
 warnings.filterwarnings("ignore")
 from torch.utils.tensorboard import SummaryWriter
 
@@ -18,6 +19,7 @@ from torch.utils.tensorboard import SummaryWriter
 import argparse
 import json
 import os
+import time
 from pathlib import Path
 from typing import Tuple
 from torch.utils.data import DataLoader
@@ -26,7 +28,7 @@ import numpy as np
 # Third-Party Libraries
 import torch
 import torch.distributed as dist
-#import wandb
+import wandb
 import yaml
 from accelerate import Accelerator, DeepSpeedPlugin
 from accelerate.logging import get_logger
@@ -130,7 +132,6 @@ class VLAMTrainer(TrainerUtils):
         self.accelerator = accelerator
         self.writer = SummaryWriter(log_dir=os.path.join(cfg.run_root_dir, cfg.run_id, "tensorboard"))  # 保存目录
 
-
         # training status tracking
         self.completed_steps = 0
         self.total_batch_size = self._calculate_total_batch_size()
@@ -166,16 +167,21 @@ class VLAMTrainer(TrainerUtils):
             )
         )
 
-        #self._init_wandb()
+        self.wandb_enabled = "wandb" in getattr(self.config, "trackers", [])
+        if self.wandb_enabled:
+            self._init_wandb()
         self._init_checkpointing()
 
     def _calculate_total_batch_size(self):
-        """calculate global batch size"""
-        return (
-            self.config.datasets.vla_data.per_device_batch_size
-            * self.accelerator.num_processes
-            * self.accelerator.gradient_accumulation_steps
+        """Calculate the joint global batch consumed by one optimizer update."""
+        accumulation = self.accelerator.gradient_accumulation_steps
+        self.vla_global_batch_size = (
+            self.config.datasets.vla_data.per_device_batch_size * self.accelerator.num_processes * accumulation
         )
+        self.vlm_global_batch_size = (
+            self.config.datasets.video_data.per_device_batch_size * self.accelerator.num_processes * accumulation
+        )
+        return self.vla_global_batch_size + self.vlm_global_batch_size
 
     def _init_wandb(self):
         """initialize Weights & Biases"""
@@ -185,7 +191,8 @@ class VLAMTrainer(TrainerUtils):
                 dir=os.path.join(self.config.output_dir, "wandb"),
                 project=self.config.wandb_project,
                 entity=self.config.wandb_entity,
-                group="vla-train",
+                group="vla-jepa-cotrain",
+                config=OmegaConf.to_container(self.config, resolve=True),
             )
 
     def _init_checkpointing(self):
@@ -209,7 +216,6 @@ class VLAMTrainer(TrainerUtils):
         """save current training state"""
 
         if accelerator.is_main_process:
-
             checkpoint_path = os.path.join(self.checkpoint_dir, f"steps_{self.completed_steps}")
             # save model state
             state_dict = self.accelerator.get_state_dict(self.model)
@@ -224,29 +230,44 @@ class VLAMTrainer(TrainerUtils):
             self.accelerator.print(f"✅ Checkpoint saved at {checkpoint_path}")
         accelerator.wait_for_everyone()
 
+    def _reduce_scalar(self, value, *, reduction="mean"):
+        """Reduce a scalar metric across ranks before logging it."""
+        metric = torch.as_tensor(value, device=self.accelerator.device, dtype=torch.float32)
+        if dist.is_initialized():
+            op = dist.ReduceOp.MAX if reduction == "max" else dist.ReduceOp.SUM
+            dist.all_reduce(metric, op=op)
+            if reduction == "mean":
+                metric /= dist.get_world_size()
+        return metric.item()
+
     def _log_metrics(self, metrics):
-        """record training metrics"""
-        if (
-            self.completed_steps % self.config.trainer.logging_frequency == 0
-        ):  # some parameters should be initialized for the class
-            if dist.get_rank() == 0:
-                # calculate gradient norm
-                # total_norm = 0.0
-                # for p in self.model.parameters():
-                #     if p.grad is not None:
-                #         total_norm += p.grad.data.norm(2).item() ** 2
-                # metrics["grad_norm"] = total_norm ** 0.5
+        """Record reduced co-training, performance, system, and LR metrics."""
+        if self.completed_steps % self.config.trainer.logging_frequency != 0:
+            return
 
-                # add learning rate
-                metrics["learning_rate"] = self.lr_scheduler.get_last_lr()[0]
+        reduced_metrics = {}
+        for name, value in metrics.items():
+            reduction = "max" if name.endswith(("_time", "_memory_gb")) else "mean"
+            namespace = "perf" if name.endswith("_time") else "system" if name.endswith("_memory_gb") else "train"
+            reduced_metrics[f"{namespace}/{name}"] = self._reduce_scalar(value, reduction=reduction)
 
-                # add epoch information
-                metrics["epoch"] = round(self.completed_steps / len(self.vla_train_dataloader), 2)
+        step_time = reduced_metrics["perf/step_time"]
+        reduced_metrics["perf/samples_per_second"] = self.total_batch_size / max(step_time, 1.0e-12)
+        reduced_metrics["progress/vla_epoch"] = round(self.completed_steps / len(self.vla_train_dataloader), 4)
+        reduced_metrics["progress/vlm_epoch"] = round(self.completed_steps / len(self.video_train_dataloader), 4)
+        reduced_metrics["progress/vla_samples_seen"] = self.completed_steps * self.vla_global_batch_size
+        reduced_metrics["progress/vlm_samples_seen"] = self.completed_steps * self.vlm_global_batch_size
+        reduced_metrics["progress/joint_samples_seen"] = self.completed_steps * self.total_batch_size
 
-                # record to W&B
-                #wandb.log(metrics, step=self.completed_steps)
-                # debug output
-                logger.info(f"Step {self.completed_steps}, Loss: {metrics})")
+        learning_rates = self.lr_scheduler.get_last_lr()
+        for index, (group, learning_rate) in enumerate(zip(self.optimizer.param_groups, learning_rates)):
+            group_name = group.get("name", f"group_{index}")
+            reduced_metrics[f"lr/{group_name}"] = learning_rate
+
+        if self.accelerator.is_main_process:
+            if self.wandb_enabled:
+                wandb.log(reduced_metrics, step=self.completed_steps)
+            logger.info(f"Step {self.completed_steps}, Metrics: {reduced_metrics}")
 
     def _create_data_iterators(self):
         """create data iterators"""
@@ -271,7 +292,9 @@ class VLAMTrainer(TrainerUtils):
         except StopIteration:
             if not hasattr(self, "vlm_epoch_count"):
                 self.vlm_epoch_count = 0
-            self.vlm_iter, self.vlm_epoch_count = self._reset_dataloader(self.video_train_dataloader, self.vlm_epoch_count)
+            self.vlm_iter, self.vlm_epoch_count = self._reset_dataloader(
+                self.video_train_dataloader, self.vlm_epoch_count
+            )
             batch_vlm = next(self.vlm_iter)
 
         return batch_vla, batch_vlm
@@ -292,10 +315,16 @@ class VLAMTrainer(TrainerUtils):
         # main training loop
         while self.completed_steps < self.config.trainer.max_train_steps:
             # get data batch
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats()
+            t_start_data = time.perf_counter()
             batch_vla, batch_vlm = self._get_next_batch()
+            t_end_data = time.perf_counter()
 
             # execute training step
+            t_start_model = time.perf_counter()
             step_metrics = self._train_step(batch_vla, batch_vlm)
+            t_end_model = time.perf_counter()
 
             # update progress
             if self.accelerator.sync_gradients:
@@ -303,10 +332,18 @@ class VLAMTrainer(TrainerUtils):
                 self.completed_steps += 1
 
             # evaluate model
-            if self.completed_steps % self.config.trainer.eval_interval == 0:
+            eval_interval = int(getattr(self.config.trainer, "eval_interval", 0))
+            if eval_interval > 0 and self.completed_steps % eval_interval == 0:
                 step_metrics = self.eval_action_model(step_metrics)
 
             # record metrics
+            step_metrics["data_time"] = t_end_data - t_start_data
+            step_metrics["model_time"] = t_end_model - t_start_model
+            step_metrics["step_time"] = t_end_model - t_start_data
+            if torch.cuda.is_available():
+                step_metrics["gpu_allocated_memory_gb"] = torch.cuda.memory_allocated() / (1024**3)
+                step_metrics["gpu_reserved_memory_gb"] = torch.cuda.memory_reserved() / (1024**3)
+                step_metrics["gpu_peak_memory_gb"] = torch.cuda.max_memory_allocated() / (1024**3)
             self._log_metrics(step_metrics)
 
             # save checkpoint
@@ -323,7 +360,7 @@ class VLAMTrainer(TrainerUtils):
         self._finalize_training()
 
         # execute evaluation step
-    
+
     def eval_action_model(self, step_metrics: dict = None) -> float:
         """
         Evaluate the model on the given dataset using the specified metric function.
@@ -334,7 +371,6 @@ class VLAMTrainer(TrainerUtils):
         """
 
         if self.accelerator.is_main_process:
-
             examples, vlm_data = self._get_next_batch()
 
             score = 0.0
@@ -362,7 +398,7 @@ class VLAMTrainer(TrainerUtils):
             step_metrics["mae_score"] = mae_score
             self.writer.add_scalar("mae_score", step_metrics["mae_score"], self.completed_steps)
             self.writer.add_scalar("mse_score", step_metrics["mse_score"], self.completed_steps)
-        
+
         pass
         dist.barrier()  # ensure all processes are synchronized
         return step_metrics
@@ -372,73 +408,104 @@ class VLAMTrainer(TrainerUtils):
         if self.accelerator.is_main_process:
             logger.info("***** Training Configuration *****")
             logger.info(f"  Total optimization steps = {self.config.trainer.max_train_steps}")
-            logger.info(f" Per device batch size = {self.config.datasets.vla_data.per_device_batch_size}")
+            logger.info(
+                "  Per-device batches = "
+                f"{self.config.datasets.vla_data.per_device_batch_size} VLA + "
+                f"{self.config.datasets.video_data.per_device_batch_size} VLM"
+            )
             logger.info(f"  Gradient accumulation steps = {self.config.trainer.gradient_accumulation_steps}")
-            logger.info(f"  Total batch size = {self.total_batch_size}")
+            logger.info(
+                f"  Global batches = {self.vla_global_batch_size} VLA + "
+                f"{self.vlm_global_batch_size} VLM = {self.total_batch_size} joint"
+            )
+            logger.info(
+                f"  Loss scales = VLA {float(self.config.trainer.loss_scale.vla):g}, "
+                f"VLM {float(self.config.trainer.loss_scale.vlm):g}"
+            )
 
     def _train_step(self, batch_vla, batch_vlm):
-        """execute single training step"""
-        log_dict = {}
+        """Accumulate VLA and VLM gradients, then perform one joint update."""
+        diagnostics_keys = {
+            "normal_code_wm_l1_metric",
+            "zero_code_wm_l1_metric",
+        }
+        logging_frequency = int(self.config.trainer.logging_frequency)
+        compute_zero_code_metric = (self.completed_steps + 1) % logging_frequency == 0
+
         with self.accelerator.accumulate(self.model):
             self.optimizer.zero_grad()
 
-            # TODO 再出错，mock 小模型查看原因
-            # VLA task forward propagation
+            # Backpropagate the robot batch first. Its activations are released
+            # before the video batch is constructed, so 16+16 does not require
+            # retaining both forward graphs at the same time.
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                output_dict = self.model.forward(batch_vla)
-                total_loss = sum(output_dict.values())
-            
-            self.accelerator.backward(total_loss)
-            # gradient clipping
-            if self.config.trainer.gradient_clipping is not None:
-                self.accelerator.clip_grad_norm_(self.model.parameters(), self.config.trainer.gradient_clipping)
+                vla_output = self.model.forward(
+                    batch_vla,
+                    compute_zero_code_metric=compute_zero_code_metric,
+                )
+                vla_diagnostics = {key: vla_output.pop(key) for key in diagnostics_keys if key in vla_output}
+                vla_losses = {key: value for key, value in vla_output.items() if key.endswith("_loss")}
+                if not vla_losses:
+                    raise RuntimeError("VLA batch did not return any '*_loss' tensors.")
+                vla_unweighted_loss = sum(vla_losses.values())
+                vla_weighted_loss = float(self.config.trainer.loss_scale.vla) * vla_unweighted_loss
+            self.accelerator.backward(vla_weighted_loss)
 
-            # optimizer step
-            self.optimizer.step()
-            self.lr_scheduler.step()
-
-            self.optimizer.zero_grad()
+            # Add the SSV2 gradient to the same parameter gradients. Do not
+            # zero gradients or step the optimizer between the two routes.
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                vlm_output = self.model.forward(batch_vlm)
-                vlm_loss = sum(vlm_output.values())
+                vlm_output = self.model.forward(
+                    batch_vlm,
+                    compute_zero_code_metric=compute_zero_code_metric,
+                )
+                vlm_diagnostics = {key: vlm_output.pop(key) for key in diagnostics_keys if key in vlm_output}
+                vlm_losses = {key: value for key, value in vlm_output.items() if key.endswith("_loss")}
+                if not vlm_losses:
+                    raise RuntimeError("VLM batch did not return any '*_loss' tensors.")
+                vlm_unweighted_loss = sum(vlm_losses.values())
+                vlm_weighted_loss = float(self.config.trainer.loss_scale.vlm) * vlm_unweighted_loss
+            self.accelerator.backward(vlm_weighted_loss)
 
-            self.accelerator.backward(vlm_loss)
-            # gradient clipping
+            # One clipping operation, optimizer update, and scheduler update
+            # define one co-training step.
+            grad_norm = None
             if self.config.trainer.gradient_clipping is not None:
-                self.accelerator.clip_grad_norm_(self.model.parameters(), self.config.trainer.gradient_clipping)
-
-            # optimizer step
+                grad_norm = self.accelerator.clip_grad_norm_(
+                    self.model.parameters(),
+                    self.config.trainer.gradient_clipping,
+                )
             self.optimizer.step()
             self.lr_scheduler.step()
 
-            """
-            self.optimizer.zero_grad()
-            #dist.barrier()  # @DEBUG
-            #pass
-            #============= Step 2
-            # VLM task forward propagation
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                vlm_output = self.model.forward(batch_vlm)
-                vlm_loss = sum(vlm_output.values())
+        joint_weighted_loss = vla_weighted_loss + vlm_weighted_loss
+        log_dict = {
+            **{f"vla_{key}": value.detach().float().item() for key, value in vla_losses.items()},
+            **{f"vlm_{key}": value.detach().float().item() for key, value in vlm_losses.items()},
+            "vla_unweighted_loss": vla_unweighted_loss.detach().float().item(),
+            "vlm_unweighted_loss": vlm_unweighted_loss.detach().float().item(),
+            "vla_weighted_loss": vla_weighted_loss.detach().float().item(),
+            "vlm_weighted_loss": vlm_weighted_loss.detach().float().item(),
+            "joint_weighted_loss": joint_weighted_loss.detach().float().item(),
+        }
+        if grad_norm is not None:
+            log_dict["grad_norm"] = torch.as_tensor(grad_norm).detach().float().item()
 
-            self.accelerator.backward(vlm_loss)
+        for prefix, route_diagnostics in (
+            ("vla", vla_diagnostics),
+            ("vlm", vlm_diagnostics),
+        ):
+            normal = route_diagnostics.get("normal_code_wm_l1_metric")
+            zero = route_diagnostics.get("zero_code_wm_l1_metric")
+            if normal is not None:
+                log_dict[f"{prefix}_normal_code_wm_l1"] = normal.detach().float().item()
+            if zero is not None:
+                log_dict[f"{prefix}_zero_code_wm_l1"] = zero.detach().float().item()
+            if normal is not None and zero is not None:
+                gain = zero - normal
+                gain_fraction = gain / zero.detach().abs().clamp_min(1.0e-8)
+                log_dict[f"{prefix}_code_gain_l1"] = gain.detach().float().item()
+                log_dict[f"{prefix}_code_gain_fraction"] = gain_fraction.detach().float().item()
 
-            #pass
-
-            #dist.barrier() #@DEBUG
-            # gradient clipping
-            if self.config.trainer.gradient_clipping is not None:
-                self.accelerator.clip_grad_norm_(self.model.parameters(), self.config.trainer.gradient_clipping)
-
-            # optimizer step
-            self.optimizer.step()
-            self.lr_scheduler.step()
-            """
-
-        for k, v in output_dict.items():
-            log_dict[f"vla_{k}"] = v.item()
-        for k, v in vlm_output.items():
-            log_dict[f"vlm_{k}"] = v.item()
         return log_dict
 
     def _finalize_training(self):
@@ -452,8 +519,8 @@ class VLAMTrainer(TrainerUtils):
             logger.info(f"Training complete. Final model saved at {final_checkpoint}")
 
         # close W&B
-        #if self.accelerator.is_main_process:
-        #    wandb.finish()
+        if self.accelerator.is_main_process and self.wandb_enabled:
+            wandb.finish()
 
         self.accelerator.wait_for_everyone()
 
@@ -499,7 +566,9 @@ def main(cfg) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config_yaml", type=str, default="starVLA/config/training/starvla_cotrain_oxe.yaml", help="Path to YAML config")
+    parser.add_argument(
+        "--config_yaml", type=str, default="starVLA/config/training/starvla_cotrain_oxe.yaml", help="Path to YAML config"
+    )
     args, clipargs = parser.parse_known_args()
 
     # Load YAML config & Convert CLI overrides to dotlist config
