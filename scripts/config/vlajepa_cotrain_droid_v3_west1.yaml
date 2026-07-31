@@ -84,7 +84,7 @@ datasets:
     video_horizon: 8
     video_backend: pyav
     gripper_threshold: 0.5
-    CoT_prompt: "Your task is {instruction}. Infer the temporal dynamics from frames {actions} and produce the corresponding policy actions {e_actions}."
+    CoT_prompt: "Your task is {instruction}. Infer the temporal dynamics from the current observation {actions} and produce the corresponding policy actions {e_actions}."
     resolution_size: 224
     video_resolution_size: 256
     per_device_batch_size: 16
