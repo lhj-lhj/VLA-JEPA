@@ -155,9 +155,14 @@ class VLATrainer(TrainerUtils):
         rank = dist.get_rank() if dist.is_initialized() else 0
         seed = self.config.seed + rank if hasattr(self.config, "seed") else rank + 3047
         set_seed(seed)
+        is_resume = bool(getattr(self.config.trainer, "is_resume", False))
 
         # load pretrained weights
-        if hasattr(self.config.trainer, "pretrained_checkpoint") and self.config.trainer.pretrained_checkpoint:
+        if (
+            not is_resume
+            and hasattr(self.config.trainer, "pretrained_checkpoint")
+            and self.config.trainer.pretrained_checkpoint
+        ):
             pretrained_checkpoint = self.config.trainer.pretrained_checkpoint
             reload_modules = (
                 self.config.trainer.reload_modules if hasattr(self.config.trainer, "reload_modules") else None
@@ -176,16 +181,17 @@ class VLATrainer(TrainerUtils):
         self.print_trainable_parameters(self.model)
 
         # initialize distributed training components
-        self.model, self.optimizer, self.vla_train_dataloader = self.setup_distributed_training(
+        self.model, self.optimizer, self.vla_train_dataloader, self.lr_scheduler = self.setup_distributed_training(
             self.accelerator,  # must be the first param
             self.model,
             self.optimizer,
             self.vla_train_dataloader,
-            # self.vlm_train_dataloader
+            self.lr_scheduler,
         )
 
-        #self._init_wandb()
+        self.wandb_enabled = "wandb" in list(getattr(self.config, "trackers", []))
         self._init_checkpointing()
+        self._init_wandb()
 
     def _calculate_total_batch_size(self):
         """calculate global batch size"""
@@ -197,55 +203,90 @@ class VLATrainer(TrainerUtils):
 
     def _init_wandb(self):
         """initialize Weights & Biases"""
-        if self.accelerator.is_main_process:
-            wandb.init(
-                name=self.config.run_id,
-                dir=os.path.join(self.config.output_dir, "wandb"),
-                project=self.config.wandb_project,
-                entity=self.config.wandb_entity,
-                group="vla-train",
-            )
+        if not self.wandb_enabled or not self.accelerator.is_main_process:
+            return
+
+        wandb_dir = os.path.join(self.config.output_dir, "wandb")
+        os.makedirs(wandb_dir, exist_ok=True)
+        run_id_path = os.path.join(self.config.output_dir, "wandb_run_id.txt")
+        if os.path.exists(run_id_path):
+            with open(run_id_path, "r", encoding="utf-8") as f:
+                wandb_run_id = f.read().strip()
+        else:
+            wandb_run_id = ""
+        if not wandb_run_id:
+            wandb_run_id = wandb.util.generate_id()
+            with open(run_id_path, "w", encoding="utf-8") as f:
+                f.write(wandb_run_id)
+
+        wandb.init(
+            id=wandb_run_id,
+            resume="allow",
+            name=self.config.run_id,
+            dir=wandb_dir,
+            project=self.config.wandb_project,
+            entity=self.config.wandb_entity,
+            group="vla-train",
+            config=OmegaConf.to_container(self.config, resolve=True),
+        )
 
     def _init_checkpointing(self):
         """initialize checkpoint directory"""
         self.checkpoint_dir = os.path.join(self.config.output_dir, "checkpoints")
         os.makedirs(self.checkpoint_dir, exist_ok=True)
 
-        pretrained_checkpoint = getattr(self.config.trainer, "pretrained_checkpoint", None)
-        is_resume = getattr(self.config.trainer, "is_resume", False)
-
-        # resume training state
-        if pretrained_checkpoint and is_resume:
-            self._load_checkpoint(self.config.resume_from_checkpoint)
+        if bool(getattr(self.config.trainer, "is_resume", False)):
+            resume_from_checkpoint = getattr(self.config.trainer, "resume_from_checkpoint", None)
+            if not resume_from_checkpoint:
+                raise ValueError("trainer.resume_from_checkpoint is required when trainer.is_resume=true")
+            self._load_checkpoint(resume_from_checkpoint)
 
     def _load_checkpoint(self, checkpoint_path):
-        """load checkpoint"""
-        self.accelerator.load_state(checkpoint_path)
-        self.accelerator.print(f"Resumed from checkpoint: {checkpoint_path}")
+        """Restore model, optimizer, scheduler, RNG, and trainer step."""
+        checkpoint_path = Path(checkpoint_path)
+        trainer_state_path = checkpoint_path / "trainer_state.json"
+        if not checkpoint_path.is_dir():
+            raise FileNotFoundError(f"Resume checkpoint directory does not exist: {checkpoint_path}")
+        if not trainer_state_path.is_file():
+            raise FileNotFoundError(
+                f"Resume checkpoint is missing trainer_state.json: {trainer_state_path}. "
+                "Legacy weight-only checkpoints cannot resume optimizer/scheduler state."
+            )
+
+        self.accelerator.load_state(str(checkpoint_path))
+        with open(trainer_state_path, "r", encoding="utf-8") as f:
+            trainer_state = json.load(f)
+        self.completed_steps = int(trainer_state["completed_steps"])
+        self.accelerator.print(
+            f"Resumed full training state from {checkpoint_path} at step {self.completed_steps}"
+        )
 
     def _save_checkpoint(self):
-        """save current training state"""
+        """Save a resumable Accelerate/DeepSpeed state and deployable weights."""
+        checkpoint_path = Path(self.checkpoint_dir) / f"steps_{self.completed_steps}"
 
-        if accelerator.is_main_process:
+        # DeepSpeed optimizer state is sharded, so every rank must participate.
+        self.accelerator.wait_for_everyone()
+        self.accelerator.save_state(str(checkpoint_path), safe_serialization=False)
+        state_dict = self.accelerator.get_state_dict(self.model)
 
-            checkpoint_path = os.path.join(self.checkpoint_dir, f"steps_{self.completed_steps}")
-            # save model state
-            state_dict = self.accelerator.get_state_dict(self.model)
-            torch.save(state_dict, checkpoint_path + "_pytorch_model.pt")
-
-            # save training metadata
-            summary_data = {
-                "steps": self.completed_steps,
+        if self.accelerator.is_main_process:
+            torch.save(state_dict, checkpoint_path / "pytorch_model.pt")
+            trainer_state = {
+                "completed_steps": self.completed_steps,
             }
-            with open(os.path.join(self.config.output_dir, "summary.jsonl"), "a") as f:
-                f.write(json.dumps(summary_data) + "\n")
-            self.accelerator.print(f"✅ Checkpoint saved at {checkpoint_path}")
-        accelerator.wait_for_everyone()
+            with open(checkpoint_path / "trainer_state.json", "w", encoding="utf-8") as f:
+                json.dump(trainer_state, f, indent=2)
+            with open(os.path.join(self.config.output_dir, "summary.jsonl"), "a", encoding="utf-8") as f:
+                f.write(json.dumps({"steps": self.completed_steps}) + "\n")
+            self.accelerator.print(f"Checkpoint saved at {checkpoint_path}")
+        self.accelerator.wait_for_everyone()
 
     def _log_metrics(self, metrics):
         """record training metrics"""
         if self.completed_steps % self.config.trainer.logging_frequency == 0:
-            if dist.get_rank() == 0:
+            if self.accelerator.is_main_process:
+                metrics = dict(metrics)
                 # add learning rate
                 metrics["learning_rate"] = self.lr_scheduler.get_last_lr()[0]
 
@@ -253,9 +294,10 @@ class VLATrainer(TrainerUtils):
                 metrics["epoch"] = round(self.completed_steps / len(self.vla_train_dataloader), 2)
 
                 # record to W&B
-                #wandb.log(metrics, step=self.completed_steps)
+                if self.wandb_enabled:
+                    wandb.log(metrics, step=self.completed_steps)
                 # debug output
-                logger.info(f"Step {self.completed_steps}, Loss: {metrics})")
+                logger.info(f"Step {self.completed_steps}, Metrics: {metrics}")
 
     def _create_data_iterators(self):
         """create data iterators"""
@@ -343,7 +385,9 @@ class VLATrainer(TrainerUtils):
 
         # create progress bar
         progress_bar = tqdm(
-            range(self.config.trainer.max_train_steps), disable=not self.accelerator.is_local_main_process
+            total=self.config.trainer.max_train_steps,
+            initial=self.completed_steps,
+            disable=not self.accelerator.is_local_main_process,
         )
 
         i = 0
@@ -394,12 +438,14 @@ class VLATrainer(TrainerUtils):
                     )
 
             # evaluate model
-            if self.completed_steps % self.config.trainer.eval_interval == 0:
+            eval_interval = int(getattr(self.config.trainer, "eval_interval", 0))
+            if eval_interval > 0 and self.completed_steps % eval_interval == 0:
                 step_metrics = self.eval_action_model(step_metrics)
 
             # record metrics
             step_metrics["data_time"] = t_end_data - t_start_data
             step_metrics["model_time"] = t_end_model - t_start_model
+            step_metrics["step_time"] = t_end_model - t_start_data
             self._log_metrics(step_metrics)
 
             # save checkpoint
@@ -495,6 +541,7 @@ class VLATrainer(TrainerUtils):
             self.lr_scheduler.step()
             
             result_dict = {k: v.item() for k, v in output_dict.items()}
+            result_dict["total_loss"] = total_loss.detach().item()
 
         return result_dict
 
@@ -509,8 +556,8 @@ class VLATrainer(TrainerUtils):
             logger.info(f"Training complete. Final model saved at {final_checkpoint}")
 
         # close W&B
-        #if self.accelerator.is_main_process:
-        #    wandb.finish()
+        if self.accelerator.is_main_process and self.wandb_enabled:
+            wandb.finish()
 
         self.accelerator.wait_for_everyone()
 
