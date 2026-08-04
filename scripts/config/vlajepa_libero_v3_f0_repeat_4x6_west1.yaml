@@ -84,6 +84,8 @@ trainer:
   epochs: 100
   max_train_steps: 30000
   num_warmup_steps: 5000
+  # Checkpoints contain model weights only. Optimizer and LR scheduler state
+  # are intentionally not saved or resumed.
   save_interval: 10000
   # The current inline evaluator consumes training samples; use the official
   # rollout evaluator separately instead of perturbing the training stream.
@@ -96,12 +98,6 @@ trainer:
   scheduler_specific_kwargs:
     min_lr: 1.0e-06
   freeze_modules: ''
-  loss_scale:
-    vla: 1.0
-    vlm: 0.1
-  max_grad_norm: 1.0
-  warmup_ratio: 0.1
-  weight_decay: 0.0
   logging_frequency: 10
   gradient_clipping: 1.0
   gradient_accumulation_steps: 1
@@ -111,7 +107,5 @@ trainer:
     betas: [0.9, 0.95]
     eps: 1.0e-08
     weight_decay: 1.0e-08
-  is_resume: false
-  resume_from_checkpoint: null
   enable_gradient_checkpointing: true
   enable_mixed_precision_training: true

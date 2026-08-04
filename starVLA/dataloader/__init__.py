@@ -1,11 +1,8 @@
 import json
-import os
 from accelerate.logging import get_logger
 from functools import partial
-import torch
 import numpy as np
 from torch.utils.data import DataLoader
-import numpy as np
 import torch.distributed as dist
 from pathlib import Path
 from starVLA.dataloader.vlm_datasets import make_vlm_dataloader
@@ -69,11 +66,6 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe"): # TODO now here on
 
         vla_dataset = get_lerobot_v3_datasets(data_cfg=vla_dataset_cfg)
 
-        train_sampler = (
-            torch.utils.data.distributed.DistributedSampler(vla_dataset, shuffle=True)
-            if dist.is_initialized()
-            else None
-        )
         num_workers = int(vla_dataset_cfg.get("num_workers", 8))
 
         vla_train_dataloader = DataLoader(
@@ -81,8 +73,9 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe"): # TODO now here on
             batch_size=vla_dataset_cfg.per_device_batch_size,
             collate_fn=collate_fn,
             num_workers=num_workers,
-            sampler=train_sampler,
-            shuffle=train_sampler is None,
+            # Accelerator.prepare() owns distributed sharding. Supplying a
+            # DistributedSampler here would shard the same dataset twice.
+            shuffle=True,
             pin_memory=True,
             persistent_workers=num_workers > 0,
         )
@@ -108,13 +101,12 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe"): # TODO now here on
             n_views=2,
             resolution_size=video_dataset_cfg.resolution_size)
 
-        train_sampler = torch.utils.data.distributed.DistributedSampler(video_dataset, shuffle=True)
-
         video_train_dataloader = DataLoader(
             video_dataset,
             batch_size=video_dataset_cfg.per_device_batch_size,
             collate_fn=video_collate_fn,
             num_workers=16,
-            sampler=train_sampler,
+            # Distributed sharding is applied later by Accelerator.prepare().
+            shuffle=True,
         )        
         return video_train_dataloader
