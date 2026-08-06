@@ -44,12 +44,6 @@ from starVLA.model.framework import build_framework
 from starVLA.training.trainer_utils.trainer_tools import TrainerUtils
 from starVLA.training.trainer_utils.trainer_tools import build_param_lr_groups
 
-deepspeed_plugin = DeepSpeedPlugin()
-accelerator = Accelerator(
-    deepspeed_plugin=deepspeed_plugin,
-)
-accelerator.print(accelerator.state)
-
 # Sane Defaults
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -248,7 +242,12 @@ class VLATrainer(TrainerUtils):
                 metrics["learning_rate"] = learning_rates[0]
 
                 # add epoch info
-                metrics["epoch"] = round(self.completed_steps / len(self.vla_train_dataloader), 2)
+                metrics["epoch"] = round(
+                    self.completed_steps
+                    * self.accelerator.gradient_accumulation_steps
+                    / len(self.vla_train_dataloader),
+                    2,
+                )
 
                 # record to W&B
                 if self.wandb_enabled:
@@ -359,53 +358,33 @@ class VLATrainer(TrainerUtils):
             step_metrics = self._train_step(batch_vla)
             t_end_model = time.perf_counter()
 
-            # update progress
-            if self.accelerator.sync_gradients:
+            # Count/log/save only completed optimizer updates, not individual
+            # gradient-accumulation microbatches.
+            did_update = self.accelerator.sync_gradients
+            if did_update:
                 progress_bar.update(1)
                 self.completed_steps += 1
-            
-            """
-            i += 1
-            print(i, self.completed_steps)
-            if i == 2:
-                self.initial_state_dict = {
-                    k: v.detach().clone()
-                    for k, v in self.model.state_dict().items()
-                }
-            elif i == 3:
-                comparison_state_dict = self.model.state_dict()
-                print(self.compare_state_dict(self.initial_state_dict, comparison_state_dict))
-            elif i == 4:
-                comparison_state_dict = self.model.state_dict()
-                print(self.compare_state_dict(self.initial_state_dict, comparison_state_dict))
-            elif i == 5:
-                comparison_state_dict = self.model.state_dict()
-                print(self.compare_state_dict(self.initial_state_dict, comparison_state_dict))
-                exit()
-            """
-            
-            if self.accelerator.is_local_main_process:
-                progress_bar.set_postfix(
+
+                if self.accelerator.is_local_main_process:
+                    progress_bar.set_postfix(
                         {
                             "data_times": f"{t_end_data - t_start_data:.3f}",
                             "model_times": f"{t_end_model - t_start_model:.3f}",
                         }
                     )
 
-            # evaluate model
-            eval_interval = int(getattr(self.config.trainer, "eval_interval", 0))
-            if eval_interval > 0 and self.completed_steps % eval_interval == 0:
-                step_metrics = self.eval_action_model(step_metrics)
+                # Evaluate, log, and save against the optimizer-step clock.
+                eval_interval = int(getattr(self.config.trainer, "eval_interval", 0))
+                if eval_interval > 0 and self.completed_steps % eval_interval == 0:
+                    step_metrics = self.eval_action_model(step_metrics)
 
-            # record metrics
-            step_metrics["data_time"] = t_end_data - t_start_data
-            step_metrics["model_time"] = t_end_model - t_start_model
-            step_metrics["step_time"] = t_end_model - t_start_data
-            self._log_metrics(step_metrics)
+                step_metrics["data_time"] = t_end_data - t_start_data
+                step_metrics["model_time"] = t_end_model - t_start_model
+                step_metrics["step_time"] = t_end_model - t_start_data
+                self._log_metrics(step_metrics)
 
-            # save checkpoint
-            if self.completed_steps % self.config.trainer.save_interval == 0 and self.completed_steps > 0:
-                self._save_checkpoint()
+                if self.completed_steps % self.config.trainer.save_interval == 0:
+                    self._save_checkpoint()
 
             # check termination condition
             if self.completed_steps >= self.config.trainer.max_train_steps:
@@ -477,25 +456,55 @@ class VLATrainer(TrainerUtils):
     def _train_step(self, batch_vla, batch_vlm=None):
         """execute single training step"""
         with self.accelerator.accumulate(self.model):
-            self.optimizer.zero_grad()
+            zero_code_metrics_frequency = int(
+                getattr(self.config.trainer, "zero_code_metrics_frequency", 0)
+            )
+            forward_kwargs = {}
+            if str(self.config.framework.name) == "VLA_JEPA":
+                forward_kwargs["compute_zero_code_metric"] = (
+                    self.accelerator.sync_gradients
+                    and zero_code_metrics_frequency > 0
+                    and (self.completed_steps + 1)
+                    % zero_code_metrics_frequency
+                    == 0
+                )
+
             # VLA task forward propagation
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                output_dict = self.model.forward(batch_vla)
-
-                total_loss = sum(output_dict.values())
+                output_dict = self.model.forward(batch_vla, **forward_kwargs)
+                losses = {
+                    key: value
+                    for key, value in output_dict.items()
+                    if key.endswith("_loss")
+                }
+                diagnostics = {
+                    key: value
+                    for key, value in output_dict.items()
+                    if key.endswith("_metric")
+                }
+                if not losses:
+                    raise RuntimeError("VLA batch did not return any '*_loss' tensors.")
+                total_loss = sum(losses.values())
 
             # VLA backward propagation
             self.accelerator.backward(total_loss)
 
             # gradient clipping
-            if self.config.trainer.gradient_clipping is not None:
+            if (
+                self.accelerator.sync_gradients
+                and self.config.trainer.gradient_clipping is not None
+            ):
                 self.accelerator.clip_grad_norm_(self.model.parameters(), self.config.trainer.gradient_clipping)
 
             # optimizer step
             self.optimizer.step()
             self.lr_scheduler.step()
+            self.optimizer.zero_grad()
             
-            result_dict = {k: v.item() for k, v in output_dict.items()}
+            result_dict = {
+                key: value.detach().float().item()
+                for key, value in {**losses, **diagnostics}.items()
+            }
             result_dict["total_loss"] = total_loss.detach().item()
 
         return result_dict
@@ -520,6 +529,13 @@ class VLATrainer(TrainerUtils):
 
 
 def main(cfg) -> None:
+    accelerator = Accelerator(
+        deepspeed_plugin=DeepSpeedPlugin(),
+        gradient_accumulation_steps=int(
+            cfg.trainer.get("gradient_accumulation_steps", 1)
+        ),
+    )
+    accelerator.print(accelerator.state)
     logger.info("VLA Training :: Warming Up")
 
     # create output directory and save config

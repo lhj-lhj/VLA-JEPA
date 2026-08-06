@@ -43,10 +43,6 @@ from starVLA.training.trainer_utils.trainer_tools import normalize_dotlist_args
 from starVLA.model.framework import build_framework
 from starVLA.training.trainer_utils.trainer_tools import TrainerUtils
 
-deepspeed_plugin = DeepSpeedPlugin()
-accelerator = Accelerator(deepspeed_plugin=deepspeed_plugin)
-accelerator.print(accelerator.state)
-
 # Sane Defaults
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -215,7 +211,7 @@ class VLAMTrainer(TrainerUtils):
     def _save_checkpoint(self):
         """save current training state"""
 
-        if accelerator.is_main_process:
+        if self.accelerator.is_main_process:
             checkpoint_path = os.path.join(self.checkpoint_dir, f"steps_{self.completed_steps}")
             # save model state
             state_dict = self.accelerator.get_state_dict(self.model)
@@ -228,7 +224,7 @@ class VLAMTrainer(TrainerUtils):
             with open(os.path.join(self.config.output_dir, "summary.jsonl"), "a") as f:
                 f.write(json.dumps(summary_data) + "\n")
             self.accelerator.print(f"✅ Checkpoint saved at {checkpoint_path}")
-        accelerator.wait_for_everyone()
+        self.accelerator.wait_for_everyone()
 
     def _reduce_scalar(self, value, *, reduction="mean"):
         """Reduce a scalar metric across ranks before logging it."""
@@ -253,8 +249,15 @@ class VLAMTrainer(TrainerUtils):
 
         step_time = reduced_metrics["perf/step_time"]
         reduced_metrics["perf/samples_per_second"] = self.total_batch_size / max(step_time, 1.0e-12)
-        reduced_metrics["progress/vla_epoch"] = round(self.completed_steps / len(self.vla_train_dataloader), 4)
-        reduced_metrics["progress/vlm_epoch"] = round(self.completed_steps / len(self.video_train_dataloader), 4)
+        accumulation = self.accelerator.gradient_accumulation_steps
+        reduced_metrics["progress/vla_epoch"] = round(
+            self.completed_steps * accumulation / len(self.vla_train_dataloader),
+            4,
+        )
+        reduced_metrics["progress/vlm_epoch"] = round(
+            self.completed_steps * accumulation / len(self.video_train_dataloader),
+            4,
+        )
         reduced_metrics["progress/vla_samples_seen"] = self.completed_steps * self.vla_global_batch_size
         reduced_metrics["progress/vlm_samples_seen"] = self.completed_steps * self.vlm_global_batch_size
         reduced_metrics["progress/joint_samples_seen"] = self.completed_steps * self.total_batch_size
@@ -326,31 +329,32 @@ class VLAMTrainer(TrainerUtils):
             step_metrics = self._train_step(batch_vla, batch_vlm)
             t_end_model = time.perf_counter()
 
-            # update progress
-            if self.accelerator.sync_gradients:
+            # An optimizer step is complete only on the final accumulation
+            # microbatch. Logging/eval/checkpointing must use that same clock.
+            did_update = self.accelerator.sync_gradients
+            if did_update:
                 progress_bar.update(1)
                 self.completed_steps += 1
 
-            # evaluate model
-            eval_interval = int(getattr(self.config.trainer, "eval_interval", 0))
-            if eval_interval > 0 and self.completed_steps % eval_interval == 0:
-                step_metrics = self.eval_action_model(step_metrics)
+                # evaluate model
+                eval_interval = int(getattr(self.config.trainer, "eval_interval", 0))
+                if eval_interval > 0 and self.completed_steps % eval_interval == 0:
+                    step_metrics = self.eval_action_model(step_metrics)
 
-            # record metrics
-            step_metrics["data_time"] = t_end_data - t_start_data
-            step_metrics["model_time"] = t_end_model - t_start_model
-            step_metrics["step_time"] = t_end_model - t_start_data
-            if torch.cuda.is_available():
-                step_metrics["gpu_allocated_memory_gb"] = torch.cuda.memory_allocated() / (1024**3)
-                step_metrics["gpu_reserved_memory_gb"] = torch.cuda.memory_reserved() / (1024**3)
-                step_metrics["gpu_peak_memory_gb"] = torch.cuda.max_memory_allocated() / (1024**3)
-            self._log_metrics(step_metrics)
+                # record metrics
+                step_metrics["data_time"] = t_end_data - t_start_data
+                step_metrics["model_time"] = t_end_model - t_start_model
+                step_metrics["step_time"] = t_end_model - t_start_data
+                if torch.cuda.is_available():
+                    step_metrics["gpu_allocated_memory_gb"] = torch.cuda.memory_allocated() / (1024**3)
+                    step_metrics["gpu_reserved_memory_gb"] = torch.cuda.memory_reserved() / (1024**3)
+                    step_metrics["gpu_peak_memory_gb"] = torch.cuda.max_memory_allocated() / (1024**3)
+                self._log_metrics(step_metrics)
 
-            # save checkpoint
-            if self.completed_steps % self.config.trainer.save_interval == 0 and self.completed_steps > 0:
-                self._save_checkpoint()
-
-                dist.barrier()  # ensure all processes are synchronized, avoid timeout
+                # save checkpoint
+                if self.completed_steps % self.config.trainer.save_interval == 0:
+                    self._save_checkpoint()
+                    dist.barrier()  # synchronize ranks around checkpoint I/O
 
             # check termination condition
             if self.completed_steps >= self.config.trainer.max_train_steps:
@@ -425,27 +429,29 @@ class VLAMTrainer(TrainerUtils):
 
     def _train_step(self, batch_vla, batch_vlm):
         """Accumulate VLA and VLM gradients, then perform one joint update."""
-        diagnostics_keys = {
-            "normal_code_wm_l1_metric",
-            "zero_code_wm_l1_metric",
-        }
-        zero_code_metrics_frequency = int(getattr(self.config.trainer, "zero_code_metrics_frequency", 100))
-        compute_zero_code_metric = (
-            zero_code_metrics_frequency > 0 and (self.completed_steps + 1) % zero_code_metrics_frequency == 0
-        )
-
         with self.accelerator.accumulate(self.model):
-            self.optimizer.zero_grad()
+            zero_code_metrics_frequency = int(
+                getattr(self.config.trainer, "zero_code_metrics_frequency", 100)
+            )
+            compute_zero_code_metric = (
+                self.accelerator.sync_gradients
+                and zero_code_metrics_frequency > 0
+                and (self.completed_steps + 1) % zero_code_metrics_frequency == 0
+            )
 
             # Backpropagate the robot batch first. Its activations are released
-            # before the video batch is constructed, so 16+16 does not require
+            # before the video batch is constructed, so 8+8 does not require
             # retaining both forward graphs at the same time.
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 vla_output = self.model.forward(
                     batch_vla,
                     compute_zero_code_metric=compute_zero_code_metric,
                 )
-                vla_diagnostics = {key: vla_output.pop(key) for key in diagnostics_keys if key in vla_output}
+                vla_diagnostics = {
+                    key: vla_output.pop(key)
+                    for key in tuple(vla_output)
+                    if key.endswith("_metric")
+                }
                 vla_losses = {key: value for key, value in vla_output.items() if key.endswith("_loss")}
                 if not vla_losses:
                     raise RuntimeError("VLA batch did not return any '*_loss' tensors.")
@@ -460,7 +466,11 @@ class VLAMTrainer(TrainerUtils):
                     batch_vlm,
                     compute_zero_code_metric=compute_zero_code_metric,
                 )
-                vlm_diagnostics = {key: vlm_output.pop(key) for key in diagnostics_keys if key in vlm_output}
+                vlm_diagnostics = {
+                    key: vlm_output.pop(key)
+                    for key in tuple(vlm_output)
+                    if key.endswith("_metric")
+                }
                 vlm_losses = {key: value for key, value in vlm_output.items() if key.endswith("_loss")}
                 if not vlm_losses:
                     raise RuntimeError("VLM batch did not return any '*_loss' tensors.")
@@ -471,13 +481,17 @@ class VLAMTrainer(TrainerUtils):
             # One clipping operation, optimizer update, and scheduler update
             # define one co-training step.
             grad_norm = None
-            if self.config.trainer.gradient_clipping is not None:
+            if (
+                self.accelerator.sync_gradients
+                and self.config.trainer.gradient_clipping is not None
+            ):
                 grad_norm = self.accelerator.clip_grad_norm_(
                     self.model.parameters(),
                     self.config.trainer.gradient_clipping,
                 )
             self.optimizer.step()
             self.lr_scheduler.step()
+            self.optimizer.zero_grad()
 
         joint_weighted_loss = vla_weighted_loss + vlm_weighted_loss
         log_dict = {
@@ -496,12 +510,13 @@ class VLAMTrainer(TrainerUtils):
             ("vla", vla_diagnostics),
             ("vlm", vlm_diagnostics),
         ):
+            for metric_name, metric_value in route_diagnostics.items():
+                clean_name = metric_name.removesuffix("_metric")
+                log_dict[f"{prefix}_{clean_name}"] = (
+                    metric_value.detach().float().item()
+                )
             normal = route_diagnostics.get("normal_code_wm_l1_metric")
             zero = route_diagnostics.get("zero_code_wm_l1_metric")
-            if normal is not None:
-                log_dict[f"{prefix}_normal_code_wm_l1"] = normal.detach().float().item()
-            if zero is not None:
-                log_dict[f"{prefix}_zero_code_wm_l1"] = zero.detach().float().item()
             if normal is not None and zero is not None:
                 gain = zero - normal
                 gain_fraction = gain / zero.detach().abs().clamp_min(1.0e-8)
@@ -531,6 +546,13 @@ from starVLA.training.trainer_utils.trainer_tools import build_param_lr_groups
 
 
 def main(cfg) -> None:
+    accelerator = Accelerator(
+        deepspeed_plugin=DeepSpeedPlugin(),
+        gradient_accumulation_steps=int(
+            cfg.trainer.get("gradient_accumulation_steps", 1)
+        ),
+    )
+    accelerator.print(accelerator.state)
     logger.info("VLA Training :: Warming Up")
 
     # create output directory and save config

@@ -438,13 +438,16 @@ class VLATrainer(TrainerUtils):
                     batch_vla,
                     compute_zero_code_metric=compute_zero_code_metric,
                 )
-                normal_code_wm_l1 = output_dict.pop(
-                    "normal_code_wm_l1_metric",
-                    None,
+                diagnostic_metrics = {
+                    key: output_dict.pop(key)
+                    for key in tuple(output_dict)
+                    if key.endswith("_metric")
+                }
+                normal_code_wm_l1 = diagnostic_metrics.get(
+                    "normal_code_wm_l1_metric"
                 )
-                zero_code_wm_l1 = output_dict.pop(
-                    "zero_code_wm_l1_metric",
-                    None,
+                zero_code_wm_l1 = diagnostic_metrics.get(
+                    "zero_code_wm_l1_metric"
                 )
                 total_loss = sum(output_dict.values())
 
@@ -463,6 +466,12 @@ class VLATrainer(TrainerUtils):
             self.lr_scheduler.step()
         
         result_dict = {k: v.detach().float().item() for k, v in output_dict.items()}
+        result_dict.update(
+            {
+                key.removesuffix("_metric"): value.detach().float().item()
+                for key, value in diagnostic_metrics.items()
+            }
+        )
         if normal_code_wm_l1 is not None and zero_code_wm_l1 is not None:
             normal_code_l1 = normal_code_wm_l1.detach().float().item()
             zero_code_l1 = zero_code_wm_l1.detach().float().item()

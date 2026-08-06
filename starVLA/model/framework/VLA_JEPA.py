@@ -31,6 +31,12 @@ from starVLA.model.modules.world_model.vj2_predictor import (
     VisionTransformerPredictorAC,
     VisionTransformerPredictorAC_New,
 )
+from starVLA.model.modules.world_model.causal_adaln_predictor import (
+    balanced_diagonal_gaussian_kl,
+    CausalAdaLNWorldModel,
+    GaussianCodeProjector,
+    split_video_into_tubelets,
+)
 from starVLA.training.trainer_utils.trainer_tools import resize_images
 from starVLA.model.tools import FRAMEWORK_REGISTRY
 
@@ -64,10 +70,10 @@ class VLA_JEPA(baseframework):
         self.qwen_vl_interface = get_vlm_model(config=self.config)
         qwenvl_config = self.config.framework.get("qwenvl", {})
         self.qwen_input_mode = str(qwenvl_config.get("input_mode", "image")).lower()
-        if self.qwen_input_mode not in {"image", "video"}:
+        if self.qwen_input_mode not in {"image", "video", "paired_image_video"}:
             raise ValueError(
                 f"Unsupported Qwen input_mode={self.qwen_input_mode!r}; "
-                "expected 'image' or 'video'."
+                "expected 'image', 'video', or 'paired_image_video'."
             )
         self.qwen_visual_resized_height = int(
             qwenvl_config.get("visual_resized_height", 256)
@@ -93,6 +99,19 @@ class VLA_JEPA(baseframework):
         self.future_action_window_size = config.framework.action_model.future_action_window_size
         self.past_action_window_size = config.framework.action_model.past_action_window_size
         self.chunk_len = self.past_action_window_size + 1 + self.future_action_window_size
+        # The official VLA-JEPA YAML stores this under ``framework.action_model``.
+        # Upstream accidentally reads ``trainer.repeated_diffusion_steps`` in
+        # forward(), which silently falls back to 4 even though the released
+        # config requests 8. Prefer the documented action-model field while
+        # retaining the trainer key only as a compatibility fallback.
+        self.repeated_diffusion_steps = int(
+            config.framework.action_model.get(
+                "repeated_diffusion_steps",
+                config.trainer.get("repeated_diffusion_steps", 4),
+            )
+        )
+        if self.repeated_diffusion_steps < 1:
+            raise ValueError("repeated_diffusion_steps must be at least 1.")
         
         self.vj_encoder = AutoModel.from_pretrained(self.config.framework.vj2_model.base_encoder)
         self.vj_processor = AutoVideoProcessor.from_pretrained(self.config.framework.vj2_model.base_encoder)
@@ -105,24 +124,184 @@ class VLA_JEPA(baseframework):
             "original": VisionTransformerPredictorAC,
             "f0_repeat_noncausal": VisionTransformerPredictorAC_New,
         }
-        if self.vj_predictor_variant not in predictor_classes:
+        self.is_causal_kl_variant = (
+            self.vj_predictor_variant == "causal_adaln_tubelet"
+        )
+        supported_predictors = tuple(predictor_classes) + (
+            "causal_adaln_tubelet",
+        )
+        if self.vj_predictor_variant not in supported_predictors:
             raise ValueError(
                 f"Unsupported V-JEPA predictor_variant={self.vj_predictor_variant!r}; "
-                f"expected one of {tuple(predictor_classes)}."
+                f"expected one of {supported_predictors}."
             )
-        predictor_cls = predictor_classes[self.vj_predictor_variant]
-        self.vj_predictor = predictor_cls(
-            num_frames=self.config.framework.vj2_model.num_frames//tubelet_size,
-            img_size=((self.vj_encoder.config.image_size, self.vj_encoder.config.image_size)),
-            tubelet_size=1,
-            depth=self.config.framework.vj2_model.depth,
-            num_heads=self.config.framework.vj2_model.num_heads,
-            embed_dim=self.vj_encoder.config.hidden_size * 2, # multi view
-            action_embed_dim=self.qwen_vl_interface.model.config.hidden_size,
-            num_add_tokens=self.config.framework.vj2_model.num_action_tokens_per_timestep,
-        )
-        num_vj_states = self.config.framework.vj2_model.num_frames // tubelet_size
-        num_code_groups = num_vj_states if self.vj_predictor_variant == "f0_repeat_noncausal" else num_vj_states - 1
+
+        vj2_config = self.config.framework.vj2_model
+        num_vj_views = int(vj2_config.get("num_views", 2))
+        vj_embed_dim = self.vj_encoder.config.hidden_size * num_vj_views
+        if self.is_causal_kl_variant:
+            if self.qwen_input_mode != "paired_image_video":
+                raise ValueError(
+                    "causal_adaln_tubelet requires "
+                    "qwenvl.input_mode=paired_image_video."
+                )
+            encoder_tubelet_size = int(self.vj_encoder.config.tubelet_size)
+            num_frames = int(vj2_config.num_frames)
+            if num_frames % encoder_tubelet_size:
+                raise ValueError(
+                    f"num_frames={num_frames} must be divisible by the frozen "
+                    f"encoder tubelet_size={encoder_tubelet_size}."
+                )
+            self.num_target_tubelets = num_frames // encoder_tubelet_size
+            self.rollout_target_tubelet_indices = tuple(
+                int(index)
+                for index in vj2_config.get(
+                    "rollout_target_tubelet_indices",
+                    list(range(1, self.num_target_tubelets)),
+                )
+            )
+            if not self.rollout_target_tubelet_indices:
+                raise ValueError("rollout_target_tubelet_indices cannot be empty.")
+            if tuple(sorted(set(self.rollout_target_tubelet_indices))) != (
+                self.rollout_target_tubelet_indices
+            ):
+                raise ValueError(
+                    "rollout_target_tubelet_indices must be unique and increasing."
+                )
+            if self.rollout_target_tubelet_indices[0] <= 0:
+                raise ValueError(
+                    "Rollout targets must follow the initial 0th tubelet."
+                )
+            if (
+                self.rollout_target_tubelet_indices[-1]
+                >= self.num_target_tubelets
+            ):
+                raise ValueError(
+                    "rollout_target_tubelet_indices exceed the configured "
+                    "video horizon."
+                )
+            expected_tubelet_indices = tuple(
+                range(1, self.num_target_tubelets)
+            )
+            if (
+                self.rollout_target_tubelet_indices
+                != expected_tubelet_indices
+            ):
+                raise ValueError(
+                    "Teacher-forced tubelet training requires every shifted "
+                    "target in order; expected "
+                    f"{expected_tubelet_indices}, got "
+                    f"{self.rollout_target_tubelet_indices}."
+                )
+
+            latent_config = self.config.framework.get("latent_alignment", {})
+            self.latent_dim = int(latent_config.get("latent_dim", 256))
+            self.kl_weight = float(latent_config.get("kl_weight", 0.01))
+            self.kl_free_bits = float(latent_config.get("free_bits", 0.0))
+            self.kl_dynamics_scale = float(
+                latent_config.get("dynamics_scale", 1.0)
+            )
+            self.kl_representation_scale = float(
+                latent_config.get("representation_scale", 0.1)
+            )
+            self.posterior_prompt = str(
+                latent_config.get(
+                    "posterior_prompt",
+                    "Infer the temporal dynamics from this video {actions}.",
+                )
+            )
+            self.posterior_use_instruction = bool(
+                latent_config.get("posterior_use_instruction", False)
+            )
+            self.deterministic_latent_eval = bool(
+                latent_config.get("deterministic_eval", True)
+            )
+            self.vla_wm_loss_weight = float(
+                vj2_config.get("vla_wm_loss_weight", 0.1)
+            )
+            self.vlm_wm_loss_weight = float(
+                vj2_config.get("vlm_wm_loss_weight", 1.0)
+            )
+            self.tubelet_encode_batch_size = int(
+                vj2_config.get("tubelet_encode_batch_size", 64)
+            )
+            if (
+                self.kl_weight < 0
+                or self.kl_free_bits < 0
+                or self.kl_dynamics_scale < 0
+                or self.kl_representation_scale < 0
+                or self.vla_wm_loss_weight < 0
+                or self.vlm_wm_loss_weight < 0
+            ):
+                raise ValueError(
+                    "KL/free-bits/balance and WM loss weights must be "
+                    "non-negative."
+                )
+            if self.tubelet_encode_batch_size <= 0:
+                raise ValueError("tubelet_encode_batch_size must be positive.")
+
+            self.code_projector = GaussianCodeProjector(
+                input_dim=self.qwen_vl_interface.model.config.hidden_size,
+                latent_dim=self.latent_dim,
+                min_logvar=float(latent_config.get("min_logvar", -6.0)),
+                max_logvar=float(latent_config.get("max_logvar", 2.0)),
+            )
+            encoder_patch_size = int(self.vj_encoder.config.patch_size)
+            configured_patch_size = int(
+                vj2_config.get("patch_size", encoder_patch_size)
+            )
+            if configured_patch_size != encoder_patch_size:
+                raise ValueError(
+                    "The causal WM patch grid must match the frozen V-JEPA 2 "
+                    f"encoder: configured {configured_patch_size}, encoder "
+                    f"{encoder_patch_size}."
+                )
+            self.vj_predictor = CausalAdaLNWorldModel(
+                img_size=(
+                    self.vj_encoder.config.image_size,
+                    self.vj_encoder.config.image_size,
+                ),
+                patch_size=encoder_patch_size,
+                embed_dim=vj_embed_dim,
+                predictor_embed_dim=int(
+                    vj2_config.get("predictor_embed_dim", 1024)
+                ),
+                latent_dim=self.latent_dim,
+                code_tokens_per_step=int(
+                    vj2_config.num_action_tokens_per_timestep
+                ),
+                depth=int(vj2_config.depth),
+                num_heads=int(vj2_config.num_heads),
+                mlp_ratio=float(vj2_config.get("mlp_ratio", 4.0)),
+                drop_rate=float(vj2_config.get("drop_rate", 0.0)),
+                attn_drop_rate=float(vj2_config.get("attn_drop_rate", 0.0)),
+                drop_path_rate=float(vj2_config.get("drop_path_rate", 0.0)),
+                use_silu=bool(vj2_config.get("use_silu", False)),
+                wide_silu=bool(vj2_config.get("wide_silu", True)),
+                use_activation_checkpointing=bool(
+                    vj2_config.get("use_activation_checkpointing", True)
+                ),
+            )
+            # This encoder is a fixed target network, independent of trainer
+            # freeze strings. Keeping it in eval mode also disables stochastic
+            # depth when the parent model enters train mode.
+            self.vj_encoder.requires_grad_(False)
+            self.vj_encoder.eval()
+            num_code_groups = len(self.rollout_target_tubelet_indices)
+        else:
+            predictor_cls = predictor_classes[self.vj_predictor_variant]
+            self.vj_predictor = predictor_cls(
+                num_frames=self.config.framework.vj2_model.num_frames//tubelet_size,
+                img_size=((self.vj_encoder.config.image_size, self.vj_encoder.config.image_size)),
+                tubelet_size=1,
+                depth=self.config.framework.vj2_model.depth,
+                num_heads=self.config.framework.vj2_model.num_heads,
+                embed_dim=vj_embed_dim,
+                action_embed_dim=self.qwen_vl_interface.model.config.hidden_size,
+                num_add_tokens=self.config.framework.vj2_model.num_action_tokens_per_timestep,
+            )
+            num_vj_states = self.config.framework.vj2_model.num_frames // tubelet_size
+            num_code_groups = num_vj_states if self.vj_predictor_variant == "f0_repeat_noncausal" else num_vj_states - 1
         self.replace_prompt = "".join(
             [each * self.config.framework.vj2_model.num_action_tokens_per_timestep for each in
              action_tokens[:num_code_groups]]
@@ -159,6 +338,430 @@ class VLA_JEPA(baseframework):
         logger.info(f"Model embedding size: {vla_embedding_size} ;tokenizer.vocab_size: {len(tokenizer)}")
         return action_tokens, action_token_ids, embodied_action_token_id
 
+    def train(self, mode: bool = True):
+        """Keep the causal variant's target encoder frozen and deterministic."""
+
+        super().train(mode)
+        if getattr(self, "is_causal_kl_variant", False):
+            self.vj_encoder.eval()
+        return self
+
+    def _extract_qwen_hidden_tokens(
+        self,
+        qwen_inputs,
+        *,
+        expected_action_tokens: int,
+        extract_embodied_tokens: bool,
+    ):
+        """Run Qwen once and gather the special-token hidden states."""
+
+        action_ids = torch.tensor(
+            self.action_token_ids,
+            device=qwen_inputs["input_ids"].device,
+        )
+        action_mask = torch.isin(qwen_inputs["input_ids"], action_ids)
+        action_counts = action_mask.sum(dim=1)
+        if not torch.all(action_counts == expected_action_tokens):
+            raise ValueError(
+                "Every Qwen route must contain exactly "
+                f"{expected_action_tokens} latent action tokens; got "
+                f"{action_counts.detach().cpu().tolist()}."
+            )
+
+        embodied_mask = None
+        if extract_embodied_tokens:
+            embodied_mask = qwen_inputs["input_ids"].eq(self.embodied_action_token_id)
+            expected_embodied_tokens = int(
+                self.config.framework.vj2_model.num_embodied_action_tokens_per_instruction
+            )
+            embodied_counts = embodied_mask.sum(dim=1)
+            if not torch.all(embodied_counts == expected_embodied_tokens):
+                raise ValueError(
+                    "Every robot prior must contain exactly "
+                    f"{expected_embodied_tokens} embodied action tokens; got "
+                    f"{embodied_counts.detach().cpu().tolist()}."
+                )
+
+        qwen_outputs = self.qwen_vl_interface(
+            **qwen_inputs,
+            output_attentions=False,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+        last_hidden = qwen_outputs.hidden_states[-1]
+        batch_size, _, hidden_dim = last_hidden.shape
+        action_tokens = last_hidden[action_mask].view(
+            batch_size,
+            expected_action_tokens,
+            hidden_dim,
+        )
+        embodied_tokens = None
+        if embodied_mask is not None:
+            embodied_tokens = last_hidden[embodied_mask].view(
+                batch_size,
+                -1,
+                hidden_dim,
+            )
+        return action_tokens, embodied_tokens
+
+    def _prepare_vj_videos(self, batch_videos: np.ndarray) -> torch.Tensor:
+        """Apply the official Hugging Face V-JEPA 2 preprocessing per view."""
+
+        if batch_videos.ndim != 6:
+            raise ValueError(
+                "Expected videos [B,V,T,H,W,C], got "
+                f"{tuple(batch_videos.shape)}."
+            )
+        batch_size, num_views, _, _, _, channels = batch_videos.shape
+        if channels != 3:
+            raise ValueError("V-JEPA videos must be RGB.")
+
+        videos_chw = batch_videos.transpose(0, 1, 2, 5, 3, 4)
+        videos_chw = videos_chw.reshape(
+            batch_size * num_views,
+            *videos_chw.shape[2:],
+        )
+        encoder_device = next(self.vj_encoder.parameters()).device
+        processed = [
+            self.vj_processor(videos=video, return_tensors="pt")[
+                "pixel_values_videos"
+            ]
+            for video in videos_chw
+        ]
+        return torch.cat(processed, dim=0).to(encoder_device)
+
+    def _encode_vj_tubelets_independently(
+        self,
+        input_videos: torch.Tensor,
+        *,
+        batch_size: int,
+        num_views: int,
+    ) -> torch.Tensor:
+        """Encode each non-overlapping tubelet with the frozen V-JEPA 2 encoder.
+
+        For the released encoder, ``tubelet_size=2``. An eight-frame input is
+        therefore split into four isolated clips: ``01``, ``23``, ``45``, and
+        ``67``. Encoding those clips separately preserves the official temporal
+        patch embedding while preventing target leakage across rollout states.
+        Output is restored to ``[B,S,P,V*D]``, where ``S=T/tubelet_size``.
+        """
+
+        if input_videos.ndim != 5:
+            raise ValueError(
+                "Expected preprocessed videos [B*V,T,C,H,W], got "
+                f"{tuple(input_videos.shape)}."
+            )
+        if input_videos.shape[0] != batch_size * num_views:
+            raise ValueError("Preprocessed V-JEPA batch/view dimensions do not match.")
+        num_frames = input_videos.shape[1]
+        expected_frames = int(self.config.framework.vj2_model.num_frames)
+        if num_frames != expected_frames:
+            raise ValueError(f"Expected {expected_frames} frames, got {num_frames}.")
+
+        tubelet_size = int(self.vj_encoder.config.tubelet_size)
+        if num_frames % tubelet_size:
+            raise ValueError(
+                f"{num_frames} frames cannot be split into tubelets of "
+                f"size {tubelet_size}."
+            )
+        num_tubelets = num_frames // tubelet_size
+        tubelet_clips = split_video_into_tubelets(
+            input_videos,
+            batch_size=batch_size,
+            num_views=num_views,
+            tubelet_size=tubelet_size,
+        )
+
+        encoded_chunks = []
+        self.vj_encoder.eval()
+        with torch.no_grad():
+            for start in range(
+                0,
+                tubelet_clips.shape[0],
+                self.tubelet_encode_batch_size,
+            ):
+                encoded = self.vj_encoder.get_vision_features(
+                    pixel_values_videos=tubelet_clips[
+                        start : start + self.tubelet_encode_batch_size
+                    ]
+                )
+                encoded_chunks.append(encoded.detach())
+        tubelet_features = torch.cat(encoded_chunks, dim=0)
+        if tubelet_features.shape[1] != self.vj_predictor.tokens_per_frame:
+            raise ValueError(
+                "Frozen encoder/predictor patch-grid mismatch: encoder returned "
+                f"{tubelet_features.shape[1]} tokens, predictor expects "
+                f"{self.vj_predictor.tokens_per_frame}."
+            )
+
+        feature_dim = tubelet_features.shape[-1]
+        tubelet_features = tubelet_features.view(
+            batch_size,
+            num_views,
+            num_tubelets,
+            self.vj_predictor.tokens_per_frame,
+            feature_dim,
+        )
+        # Preserve batch/view ordering before concatenating the view channels.
+        tubelet_features = tubelet_features.permute(0, 2, 3, 1, 4).reshape(
+            batch_size,
+            num_tubelets,
+            self.vj_predictor.tokens_per_frame,
+            num_views * feature_dim,
+        )
+        return tubelet_features.detach()
+
+    def _compute_action_loss(
+        self,
+        *,
+        actions,
+        embodied_action_tokens: torch.Tensor,
+        state,
+    ) -> torch.Tensor:
+        actions_tensor = torch.tensor(
+            np.array(actions),
+            device=embodied_action_tokens.device,
+            dtype=embodied_action_tokens.dtype,
+        )
+        actions_target = actions_tensor[
+            :,
+            -(self.future_action_window_size + 1) :,
+            :,
+        ]
+        repeated_diffusion_steps = self.repeated_diffusion_steps
+        actions_target = actions_target.repeat(repeated_diffusion_steps, 1, 1)
+        embodied_action_tokens = embodied_action_tokens.repeat(
+            repeated_diffusion_steps,
+            1,
+            1,
+        )
+
+        state_repeated = None
+        if state is not None:
+            state_repeated = torch.tensor(
+                np.array(state),
+                device=embodied_action_tokens.device,
+                dtype=embodied_action_tokens.dtype,
+            ).repeat(repeated_diffusion_steps, 1, 1)
+        return self.action_model(
+            embodied_action_tokens,
+            actions_target,
+            state_repeated,
+        )
+
+    def _forward_causal_kl(
+        self,
+        *,
+        examples,
+        batch_images,
+        batch_videos,
+        instructions,
+        actions,
+        state,
+        compute_zero_code_metric: bool,
+    ):
+        """Paired posterior/prior path with a frozen target and causal rollout."""
+
+        batch_size, num_views, _ = batch_videos.shape[:3]
+        expected_views = int(self.config.framework.vj2_model.get("num_views", 2))
+        if num_views != expected_views:
+            raise ValueError(
+                f"Expected {expected_views} V-JEPA views, got {num_views}."
+            )
+        rollout_steps = len(self.rollout_target_tubelet_indices)
+        code_tokens_per_step = int(
+            self.config.framework.vj2_model.num_action_tokens_per_timestep
+        )
+        expected_action_tokens = rollout_steps * code_tokens_per_step
+
+        # Compute the frozen target first. This releases V-JEPA 2's temporary
+        # activations before either trainable Qwen graph is constructed.
+        input_videos = self._prepare_vj_videos(batch_videos)
+        target_features = self._encode_vj_tubelets_independently(
+            input_videos,
+            batch_size=batch_size,
+            num_views=num_views,
+        )
+        del input_videos
+
+        # Image + language is the inference-time prior.
+        dataset_config = (
+            self.config.datasets.vla_data
+            if actions is not None
+            else self.config.datasets.video_data
+        )
+        prior_replacements = {"{actions}": self.replace_prompt}
+        if actions is not None:
+            prior_replacements["{e_actions}"] = self.embodied_replace_prompt
+        prior_inputs = self.qwen_vl_interface.build_qwenvl_inputs(
+            images=batch_images,
+            instructions=instructions,
+            prompt_replace_dict=prior_replacements,
+            prompt_template=dataset_config.get("CoT_prompt", ""),
+            visual_resized_height=self.qwen_visual_resized_height,
+            visual_resized_width=self.qwen_visual_resized_width,
+        )
+        prior_tokens, embodied_action_tokens = self._extract_qwen_hidden_tokens(
+            prior_inputs,
+            expected_action_tokens=expected_action_tokens,
+            extract_embodied_tokens=actions is not None,
+        )
+
+        # Future video is the training-only posterior. Qwen consumes one video
+        # stream while the frozen target encoder retains both configured views.
+        missing_fps = [
+            index for index, example in enumerate(examples) if "video_fps" not in example
+        ]
+        if missing_fps:
+            raise ValueError(
+                "Paired video posterior requires dataset-provided video_fps; "
+                f"missing for samples {missing_fps}."
+            )
+        latent_config = self.config.framework.latent_alignment
+        posterior_view_index = int(
+            latent_config.get("posterior_video_view_index", 0)
+        )
+        if not 0 <= posterior_view_index < num_views:
+            raise ValueError(
+                f"posterior_video_view_index={posterior_view_index} is out of range "
+                f"for {num_views} views."
+            )
+        posterior_videos = [
+            [
+                frame if isinstance(frame, Image.Image) else Image.fromarray(frame)
+                for frame in example["video"][posterior_view_index]
+            ]
+            for example in examples
+        ]
+        posterior_instructions = (
+            instructions if self.posterior_use_instruction else [""] * batch_size
+        )
+        posterior_inputs = self.qwen_vl_interface.build_qwenvl_inputs(
+            images=batch_images,
+            videos=posterior_videos,
+            video_fps=[float(example["video_fps"]) for example in examples],
+            instructions=posterior_instructions,
+            prompt_replace_dict={"{actions}": self.replace_prompt},
+            prompt_template=self.posterior_prompt,
+            visual_resized_height=self.qwen_visual_resized_height,
+            visual_resized_width=self.qwen_visual_resized_width,
+        )
+        posterior_tokens, _ = self._extract_qwen_hidden_tokens(
+            posterior_inputs,
+            expected_action_tokens=expected_action_tokens,
+            extract_embodied_tokens=False,
+        )
+
+        prior_mean, prior_logvar = self.code_projector(prior_tokens)
+        posterior_mean, posterior_logvar = self.code_projector(posterior_tokens)
+        (
+            kl_objective,
+            dynamics_kl,
+            representation_kl,
+            raw_kl,
+        ) = balanced_diagonal_gaussian_kl(
+            posterior_mean,
+            posterior_logvar,
+            prior_mean,
+            prior_logvar,
+            free_bits=self.kl_free_bits,
+            dynamics_scale=self.kl_dynamics_scale,
+            representation_scale=self.kl_representation_scale,
+        )
+        posterior_sample = self.code_projector.sample(
+            posterior_mean,
+            posterior_logvar,
+            deterministic=(not self.training and self.deterministic_latent_eval),
+        )
+        posterior_codes = posterior_sample.view(
+            batch_size,
+            rollout_steps,
+            code_tokens_per_step,
+            self.latent_dim,
+        )
+
+        rollout_targets = target_features[
+            :,
+            self.rollout_target_tubelet_indices,
+        ]
+        teacher_forcing_contexts = target_features[:, :-1]
+        if self.training:
+            predicted_features = self.vj_predictor.teacher_forced(
+                teacher_forcing_contexts,
+                posterior_codes,
+            )
+        else:
+            predicted_features = self.vj_predictor.rollout(
+                target_features[:, 0],
+                posterior_codes,
+            )
+        per_step_wm_l1 = (
+            predicted_features.float() - rollout_targets.float()
+        ).abs().mean(dim=(0, 2, 3))
+        wm_l1 = per_step_wm_l1.mean()
+
+        diagnostic_metrics = {
+            "kl_raw_metric": raw_kl.detach(),
+            "kl_dynamics_metric": dynamics_kl.detach(),
+            "kl_representation_metric": representation_kl.detach(),
+            "posterior_std_metric": torch.exp(
+                0.5 * posterior_logvar.float()
+            ).mean().detach(),
+            "prior_std_metric": torch.exp(
+                0.5 * prior_logvar.float()
+            ).mean().detach(),
+            "posterior_prior_mean_l1_metric": (
+                posterior_mean.float() - prior_mean.float()
+            ).abs().mean().detach(),
+        }
+        for step_index, step_l1 in enumerate(per_step_wm_l1, start=1):
+            diagnostic_metrics[f"wm_rollout_step_{step_index}_l1_metric"] = (
+                step_l1.detach()
+            )
+
+        if compute_zero_code_metric:
+            with torch.no_grad():
+                if self.training:
+                    zero_predictions = self.vj_predictor.teacher_forced(
+                        teacher_forcing_contexts,
+                        torch.zeros_like(posterior_codes),
+                    )
+                else:
+                    zero_predictions = self.vj_predictor.rollout(
+                        target_features[:, 0],
+                        torch.zeros_like(posterior_codes),
+                    )
+                zero_code_wm_l1 = (
+                    zero_predictions.float() - rollout_targets.float()
+                ).abs().mean()
+            diagnostic_metrics.update(
+                {
+                    "normal_code_wm_l1_metric": wm_l1.detach(),
+                    "zero_code_wm_l1_metric": zero_code_wm_l1.detach(),
+                }
+            )
+
+        output = {
+            "wm_loss": wm_l1
+            * (
+                self.vla_wm_loss_weight
+                if actions is not None
+                else self.vlm_wm_loss_weight
+            ),
+            "kl_loss": kl_objective * self.kl_weight,
+            **diagnostic_metrics,
+        }
+        if actions is not None:
+            if embodied_action_tokens is None:
+                raise RuntimeError("Robot prior did not return embodied action tokens.")
+            with torch.autocast("cuda", dtype=torch.float32):
+                output["action_loss"] = self._compute_action_loss(
+                    actions=actions,
+                    embodied_action_tokens=embodied_action_tokens,
+                    state=state,
+                )
+        return output
+
     def forward(
         self,
         examples: List[dict] = None,
@@ -174,6 +777,17 @@ class VLA_JEPA(baseframework):
         actions = [example["action"]for example in examples] if "action" in examples[0] else None # label [B， len, 7]
         
         state = [example["state"] for example in examples] if "state" in examples[0] else None  # [B, 1, state_dim]
+
+        if self.is_causal_kl_variant:
+            return self._forward_causal_kl(
+                examples=examples,
+                batch_images=batch_images,
+                batch_videos=np.stack(batch_videos),
+                instructions=instructions,
+                actions=actions,
+                state=state,
+                compute_zero_code_metric=compute_zero_code_metric,
+            )
 
         qwen_video_kwargs = {}
         if self.qwen_input_mode == "video":
@@ -356,9 +970,7 @@ class VLA_JEPA(baseframework):
             )  # [B, T_full, action_dim]
             actions_target = actions[:, -(self.future_action_window_size+1):, :]  # (B, chunk_len, action_dim)
 
-            repeated_diffusion_steps = (
-                self.config.trainer.get("repeated_diffusion_steps", 4) if self.config and self.config.trainer else 4
-            )
+            repeated_diffusion_steps = self.repeated_diffusion_steps
             actions_target_repeated = actions_target.repeat(repeated_diffusion_steps, 1, 1)
             embodied_action_repeated = embodied_action_tokens.repeat(repeated_diffusion_steps, 1, 1)
             
