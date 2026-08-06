@@ -10,6 +10,7 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from typing import Dict, Optional, List
 from torch.nn.utils.rnn import pad_sequence
 from transformers import BatchFeature
+from PIL import Image
 
 from qwen_vl_utils import process_vision_info
 
@@ -67,9 +68,80 @@ class _QWen3_VL_Interface(nn.Module):
         self.model = model
         self.processor = processor
         self.config = config
+        self.preprocessed_visual_inputs = bool(
+            qwenvl_config.get("preprocessed_visual_inputs", False)
+        )
 
         # alin qwen3 with qwen2.5
         self.model.config.hidden_size = self.model.config.text_config.hidden_size
+
+    def _build_legacy_image_inputs(self, messages):
+        """Reproduce the released image-checkpoint 224-to-256 processor path."""
+
+        return self.processor.apply_chat_template(
+            messages,
+            tokenize=True,
+            padding=True,
+            add_generation_prompt=True,
+            return_dict=True,
+            return_tensors="pt",
+        )
+
+    def _build_preprocessed_visual_inputs(self, messages, *, is_video):
+        """Pack dataset-resized 256x256 media without another processor resize."""
+
+        text_inputs = self.processor.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        image_inputs, video_inputs, video_kwargs = process_vision_info(
+            messages,
+            image_patch_size=self.processor.image_processor.patch_size,
+            return_video_kwargs=True,
+            return_video_metadata=True,
+        )
+        processor_kwargs = {
+            "text": text_inputs,
+            "images": image_inputs,
+            "videos": video_inputs,
+            "padding": True,
+            "return_tensors": "pt",
+            "do_resize": False,
+            **video_kwargs,
+        }
+        if is_video:
+            video_inputs, video_metadata = zip(*video_inputs)
+            processor_kwargs["videos"] = list(video_inputs)
+            processor_kwargs["video_metadata"] = list(video_metadata)
+
+        return self.processor(**processor_kwargs)
+
+    @staticmethod
+    def _validate_preprocessed_visual_size(
+        media_batches,
+        *,
+        expected_height,
+        expected_width,
+        media_name,
+    ):
+        """Fail fast instead of silently resizing a supposedly prepared input."""
+
+        expected_size = (expected_width, expected_height)
+        for sample_index, media_items in enumerate(media_batches):
+            for item_index, item in enumerate(media_items):
+                if not isinstance(item, Image.Image):
+                    raise TypeError(
+                        f"Preprocessed {media_name} inputs must be PIL images, "
+                        f"got {type(item).__name__} at sample {sample_index}, "
+                        f"item {item_index}."
+                    )
+                if item.size != expected_size:
+                    raise ValueError(
+                        f"Preprocessed {media_name} input at sample {sample_index}, "
+                        f"item {item_index} has size {item.size}; expected "
+                        f"{expected_size}. Resize it in the dataset."
+                    )
 
     def forward(
         self,
@@ -114,18 +186,22 @@ class _QWen3_VL_Interface(nn.Module):
         *,
         videos=None,
         video_fps=None,
-        video_resized_height=None,
-        video_resized_width=None,
+        visual_resized_height=256,
+        visual_resized_width=256,
         **kwargs,
     ):
         """
         Build Qwen3-VL inputs from images or already-decoded video frames.
 
-        The legacy image path intentionally keeps using ``apply_chat_template``
-        directly. For video, use Qwen's official ``process_vision_info`` path so
-        frame-rate metadata reaches Qwen3-VL's temporal position construction.
+        New runs provide 256x256 media directly from the dataset and use Qwen's
+        official ``process_vision_info`` packing without another processor
+        resize. The released image-checkpoint path remains isolated in
+        ``_build_legacy_image_inputs`` and is selected only when
+        ``preprocessed_visual_inputs`` is false.
+
         ``videos`` is a batch of frame lists and ``video_fps`` contains the
-        corresponding sampling rate for each list.
+        corresponding sampling rate for each list. The default 256x256 video
+        size matches the effective image resolution used by this project.
         """
 
         # Create messages: one message per sample
@@ -139,10 +215,22 @@ class _QWen3_VL_Interface(nn.Module):
                 raise ValueError(
                     "Videos, video FPS values, and instructions must have the same batch length."
                 )
-            if (video_resized_height is None) != (video_resized_width is None):
+            if (visual_resized_height is None) != (visual_resized_width is None):
                 raise ValueError(
-                    "video_resized_height and video_resized_width must be set together."
+                    "visual_resized_height and visual_resized_width must be set together."
                 )
+
+        if self.preprocessed_visual_inputs:
+            if visual_resized_height is None:
+                raise ValueError(
+                    "preprocessed_visual_inputs requires an explicit visual size."
+                )
+            self._validate_preprocessed_visual_size(
+                videos if videos is not None else images,
+                expected_height=visual_resized_height,
+                expected_width=visual_resized_width,
+                media_name="video frame" if videos is not None else "image",
+            )
 
         for sample_index, instruction in enumerate(instructions):
             if videos is None:
@@ -167,13 +255,13 @@ class _QWen3_VL_Interface(nn.Module):
                     "sample_fps": sample_video_fps,
                     "raw_fps": sample_video_fps,
                 }
-                if video_resized_height is not None:
-                    # Resize once inside the official qwen-vl-utils pipeline;
-                    # ``do_resize=False`` below prevents a second resize.
+                if visual_resized_height is not None:
+                    # Pin Qwen's video target to the dataset-provided size;
+                    # otherwise qwen-vl-utils applies its larger video default.
                     video_content.update(
                         {
-                            "resized_height": int(video_resized_height),
-                            "resized_width": int(video_resized_width),
+                            "resized_height": int(visual_resized_height),
+                            "resized_width": int(visual_resized_width),
                         }
                     )
                 content = [video_content]
@@ -203,48 +291,12 @@ class _QWen3_VL_Interface(nn.Module):
                 msg.append({"role": "assistant", "content": [{"type": "text", "text": solution}]})
             messages.append(msg)
 
-        if videos is None:
-            # Preserve the established image preprocessing exactly for existing
-            # VLA-JEPA configurations and checkpoints.
-            batch_inputs = self.processor.apply_chat_template(
-                messages,
-                tokenize=True,
-                padding=True,
-                add_generation_prompt=True,
-                return_dict=True,
-                return_tensors="pt",
-            )
+        if videos is None and not self.preprocessed_visual_inputs:
+            batch_inputs = self._build_legacy_image_inputs(messages)
         else:
-            # Official Qwen3-VL video preprocessing. ``process_vision_info``
-            # converts the frame lists and returns their temporal metadata;
-            # passing that metadata to the processor is what avoids an inferred
-            # or default FPS.
-            text_inputs = self.processor.apply_chat_template(
+            batch_inputs = self._build_preprocessed_visual_inputs(
                 messages,
-                tokenize=False,
-                add_generation_prompt=True,
-            )
-            image_inputs, video_inputs, video_kwargs = process_vision_info(
-                messages,
-                image_patch_size=self.processor.image_processor.patch_size,
-                return_video_kwargs=True,
-                return_video_metadata=True,
-            )
-            video_metadata = None
-            if video_inputs is not None:
-                video_inputs, video_metadata = zip(*video_inputs)
-                video_inputs = list(video_inputs)
-                video_metadata = list(video_metadata)
-
-            batch_inputs = self.processor(
-                text=text_inputs,
-                images=image_inputs,
-                videos=video_inputs,
-                video_metadata=video_metadata,
-                padding=True,
-                return_tensors="pt",
-                do_resize=False,
-                **video_kwargs,
+                is_video=videos is not None,
             )
 
         #for k, v in batch_inputs.items():

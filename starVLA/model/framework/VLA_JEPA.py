@@ -69,11 +69,11 @@ class VLA_JEPA(baseframework):
                 f"Unsupported Qwen input_mode={self.qwen_input_mode!r}; "
                 "expected 'image' or 'video'."
             )
-        self.qwen_video_resized_height = int(
-            qwenvl_config.get("video_resized_height", 224)
+        self.qwen_visual_resized_height = int(
+            qwenvl_config.get("visual_resized_height", 256)
         )
-        self.qwen_video_resized_width = int(
-            qwenvl_config.get("video_resized_width", 224)
+        self.qwen_visual_resized_width = int(
+            qwenvl_config.get("visual_resized_width", 256)
         )
         embodied_action_token = self.config.framework.vj2_model.get("embodied_action_token", "<|embodied_action|>")
         action_tokens, self.action_token_ids, self.embodied_action_token_id = self.expand_tokenizer(
@@ -201,8 +201,8 @@ class VLA_JEPA(baseframework):
             qwen_video_kwargs = {
                 "videos": qwen_videos,
                 "video_fps": [float(example["video_fps"]) for example in examples],
-                "video_resized_height": self.qwen_video_resized_height,
-                "video_resized_width": self.qwen_video_resized_width,
+                "visual_resized_height": self.qwen_visual_resized_height,
+                "visual_resized_width": self.qwen_visual_resized_width,
             }
 
         """

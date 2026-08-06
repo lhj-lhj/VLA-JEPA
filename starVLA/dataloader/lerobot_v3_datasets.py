@@ -161,10 +161,12 @@ def _convert_video_frames(
         .contiguous()
         .numpy()
     )
-    current = Image.fromarray(video_uint8[0]).resize(
-        (current_size, current_size),
-        resample=Image.Resampling.BILINEAR,
-    )
+    current = Image.fromarray(video_uint8[0])
+    if current.size != (current_size, current_size):
+        current = current.resize(
+            (current_size, current_size),
+            resample=Image.Resampling.BILINEAR,
+        )
     return current, video_uint8
 
 

@@ -111,8 +111,11 @@ def load_id2text(text_file: str) -> dict[int, str]:
 def collate_fn(batch, n_views=2, resolution_size=224):
     examples = []
     for video, instruction, video_fps in batch:
+        current_image = Image.fromarray(video[0])
+        if current_image.size != (resolution_size, resolution_size):
+            current_image = current_image.resize((resolution_size, resolution_size))
         examples.append({
-            "image": [Image.fromarray(video[0]).resize((resolution_size, resolution_size))],
+            "image": [current_image],
             "video": np.stack([video.copy() for _ in range(n_views)], axis=0),
             # Qwen receives already-decoded frames, so it cannot recover timing
             # from a file container later. Keep the source FPS with the sample.
