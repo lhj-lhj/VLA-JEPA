@@ -33,7 +33,7 @@ import wandb
 import yaml
 from accelerate import Accelerator, DeepSpeedPlugin
 from accelerate.logging import get_logger
-from accelerate.utils import GradientAccumulationPlugin, set_seed
+from accelerate.utils import set_seed
 from omegaconf import OmegaConf
 from tqdm import tqdm
 from transformers import AutoProcessor, get_scheduler
@@ -529,20 +529,7 @@ class VLATrainer(TrainerUtils):
 
 
 def main(cfg) -> None:
-    accumulation_steps = int(
-        cfg.trainer.get("gradient_accumulation_steps", 1)
-    )
-    accelerator = Accelerator(
-        deepspeed_plugin=DeepSpeedPlugin(
-            gradient_accumulation_steps=accumulation_steps,
-        ),
-        # ZeRO-2 cannot enter DeepSpeedEngine.no_sync(). Keep communication
-        # enabled per microbatch and let DeepSpeed enforce the update boundary.
-        gradient_accumulation_plugin=GradientAccumulationPlugin(
-            num_steps=accumulation_steps,
-            sync_each_batch=True,
-        ),
-    )
+    accelerator = Accelerator(deepspeed_plugin=DeepSpeedPlugin())
     accelerator.print(accelerator.state)
     logger.info("VLA Training :: Warming Up")
 

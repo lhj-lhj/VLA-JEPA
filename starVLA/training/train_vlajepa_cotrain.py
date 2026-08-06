@@ -32,7 +32,7 @@ import wandb
 import yaml
 from accelerate import Accelerator, DeepSpeedPlugin
 from accelerate.logging import get_logger
-from accelerate.utils import GradientAccumulationPlugin, set_seed
+from accelerate.utils import set_seed
 from omegaconf import OmegaConf
 from tqdm import tqdm
 from transformers import AutoProcessor, get_scheduler
@@ -546,22 +546,7 @@ from starVLA.training.trainer_utils.trainer_tools import build_param_lr_groups
 
 
 def main(cfg) -> None:
-    accumulation_steps = int(
-        cfg.trainer.get("gradient_accumulation_steps", 1)
-    )
-    accelerator = Accelerator(
-        deepspeed_plugin=DeepSpeedPlugin(
-            gradient_accumulation_steps=accumulation_steps,
-        ),
-        # DeepSpeed ZeRO-2 partitions gradients and rejects model.no_sync().
-        # Synchronize each microbatch while leaving optimizer accumulation to
-        # the DeepSpeed engine; optimizer/scheduler still update only at the
-        # configured accumulation boundary.
-        gradient_accumulation_plugin=GradientAccumulationPlugin(
-            num_steps=accumulation_steps,
-            sync_each_batch=True,
-        ),
-    )
+    accelerator = Accelerator(deepspeed_plugin=DeepSpeedPlugin())
     accelerator.print(accelerator.state)
     logger.info("VLA Training :: Warming Up")
 

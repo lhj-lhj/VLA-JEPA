@@ -70,11 +70,11 @@ def test_pretrain_loss_and_batch_contract() -> None:
         assert math.isclose(actual_video[name], expected)
 
     accumulation = config["trainer"]["gradient_accumulation_steps"]
-    assert accumulation == 2
+    assert accumulation == 1
     assert config["datasets"]["vla_data"]["per_device_batch_size"] == 8
     assert config["datasets"]["video_data"]["per_device_batch_size"] == 8
-    assert 8 * 8 * accumulation == 128
-    assert (8 + 8) * 8 * accumulation == 256
+    assert 8 * 8 * accumulation == 64
+    assert (8 + 8) * 8 * accumulation == 128
 
 
 def test_causal_media_contract_is_direct_256() -> None:
@@ -105,4 +105,4 @@ def test_repeated_diffusion_and_posttrain_batch_contract() -> None:
     posttrain = _load(POSTTRAIN_CONFIG)
     accumulation = posttrain["trainer"]["gradient_accumulation_steps"]
     per_device = posttrain["datasets"]["vla_data"]["per_device_batch_size"]
-    assert per_device * 8 * accumulation == 256
+    assert per_device * 8 * accumulation == 64
