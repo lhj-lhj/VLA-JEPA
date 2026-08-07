@@ -42,6 +42,9 @@ from starVLA.dataloader import build_dataloader
 from starVLA.training.trainer_utils.trainer_tools import normalize_dotlist_args
 from starVLA.model.framework import build_framework
 from starVLA.training.trainer_utils.trainer_tools import TrainerUtils
+from starVLA.training.trainer_utils.wm_code_schedule import (
+    use_prior_world_model_code,
+)
 
 # Sane Defaults
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -410,6 +413,7 @@ class VLAMTrainer(TrainerUtils):
     def _log_training_config(self):
         """record training config"""
         if self.accelerator.is_main_process:
+            latent_alignment = self.config.framework.get("latent_alignment", {})
             logger.info("***** Training Configuration *****")
             logger.info(f"  Total optimization steps = {self.config.trainer.max_train_steps}")
             logger.info(
@@ -426,10 +430,33 @@ class VLAMTrainer(TrainerUtils):
                 f"  Loss scales = VLA {float(self.config.trainer.loss_scale.vla):g}, "
                 f"VLM {float(self.config.trainer.loss_scale.vlm):g}"
             )
+            if bool(
+                latent_alignment.get("alternate_prior_posterior_wm", False)
+            ):
+                logger.info(
+                    "  WM code schedule = posterior through step "
+                    f"{int(latent_alignment.get('wm_posterior_only_steps', 0))}, "
+                    "then odd=posterior/even=prior"
+                )
 
     def _train_step(self, batch_vla, batch_vlm):
         """Accumulate VLA and VLM gradients, then perform one joint update."""
         with self.accelerator.accumulate(self.model):
+            optimization_step = self.completed_steps + 1
+            latent_alignment = self.config.framework.get("latent_alignment", {})
+            posterior_only_steps = int(
+                latent_alignment.get("wm_posterior_only_steps", 0)
+            )
+            use_prior_for_wm = use_prior_world_model_code(
+                optimization_step=optimization_step,
+                posterior_only_steps=posterior_only_steps,
+                alternate_after_warmup=bool(
+                    latent_alignment.get(
+                        "alternate_prior_posterior_wm",
+                        False,
+                    )
+                ),
+            )
             zero_code_metrics_frequency = int(
                 getattr(self.config.trainer, "zero_code_metrics_frequency", 100)
             )
@@ -446,6 +473,7 @@ class VLAMTrainer(TrainerUtils):
                 vla_output = self.model.forward(
                     batch_vla,
                     compute_zero_code_metric=compute_zero_code_metric,
+                    use_prior_for_wm=use_prior_for_wm,
                 )
                 vla_diagnostics = {
                     key: vla_output.pop(key)
@@ -465,6 +493,7 @@ class VLAMTrainer(TrainerUtils):
                 vlm_output = self.model.forward(
                     batch_vlm,
                     compute_zero_code_metric=compute_zero_code_metric,
+                    use_prior_for_wm=use_prior_for_wm,
                 )
                 vlm_diagnostics = {
                     key: vlm_output.pop(key)

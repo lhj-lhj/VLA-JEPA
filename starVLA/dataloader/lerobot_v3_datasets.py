@@ -24,6 +24,10 @@ import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import Dataset, get_worker_info
 
+from starVLA.posterior_view_sampling import (
+    balanced_random_view_indices,
+)
+
 
 _LEROBOT_TIMESTAMP_TOLERANCE_ERROR = (
     "One or several query timestamps unexpectedly violate the tolerance"
@@ -58,10 +62,37 @@ def _video_path_from_decode_error(error: Exception) -> str | None:
     return None
 
 
-def collate_fn(batch: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def collate_fn(
+    batch: list[dict[str, Any]],
+    *,
+    posterior_view_sampling: str = "fixed",
+    posterior_view_indices: tuple[int, int] = (0, 1),
+) -> list[dict[str, Any]]:
     """Keep starVLA's existing list-of-example batch contract."""
 
-    return batch
+    if posterior_view_sampling == "fixed":
+        return batch
+    if posterior_view_sampling != "balanced_random_single":
+        raise ValueError(
+            "posterior_view_sampling must be 'fixed' or "
+            "'balanced_random_single'."
+        )
+
+    assignments = balanced_random_view_indices(
+        batch_size=len(batch),
+        view_indices=posterior_view_indices,
+    )
+    examples = []
+    for sample, view_index in zip(batch, assignments):
+        num_views = len(sample["video"])
+        if not 0 <= view_index < num_views:
+            raise ValueError(
+                f"Posterior view {view_index} is out of range for {num_views} views."
+            )
+        example = dict(sample)
+        example["posterior_video_view_index"] = view_index
+        examples.append(example)
+    return examples
 
 
 def _load_lerobot_classes():

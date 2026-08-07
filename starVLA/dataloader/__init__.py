@@ -67,17 +67,42 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe"): # TODO now here on
         vla_dataset = get_lerobot_v3_datasets(data_cfg=vla_dataset_cfg)
 
         num_workers = int(vla_dataset_cfg.get("num_workers", 8))
+        per_device_batch_size = int(vla_dataset_cfg.per_device_batch_size)
+        posterior_view_sampling = str(
+            vla_dataset_cfg.get("posterior_view_sampling", "fixed")
+        )
+        posterior_view_indices = tuple(
+            int(index)
+            for index in vla_dataset_cfg.get(
+                "posterior_view_indices",
+                [0, 1],
+            )
+        )
+        if (
+            posterior_view_sampling == "balanced_random_single"
+            and per_device_batch_size % 2
+        ):
+            raise ValueError(
+                "balanced_random_single posterior sampling requires an even "
+                "per-device batch size."
+            )
+        vla_collate_fn = partial(
+            collate_fn,
+            posterior_view_sampling=posterior_view_sampling,
+            posterior_view_indices=posterior_view_indices,
+        )
 
         vla_train_dataloader = DataLoader(
             vla_dataset,
-            batch_size=vla_dataset_cfg.per_device_batch_size,
-            collate_fn=collate_fn,
+            batch_size=per_device_batch_size,
+            collate_fn=vla_collate_fn,
             num_workers=num_workers,
             # Accelerator.prepare() owns distributed sharding. Supplying a
             # DistributedSampler here would shard the same dataset twice.
             shuffle=True,
             pin_memory=True,
             persistent_workers=num_workers > 0,
+            drop_last=posterior_view_sampling == "balanced_random_single",
         )
         if not dist.is_initialized() or dist.get_rank() == 0:
             save_dataset_statistics(vla_dataset.dataset_statistics, Path(cfg.output_dir))

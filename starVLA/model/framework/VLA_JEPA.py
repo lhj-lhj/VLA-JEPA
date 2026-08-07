@@ -559,6 +559,7 @@ class VLA_JEPA(baseframework):
         actions,
         state,
         compute_zero_code_metric: bool,
+        use_prior_for_wm: bool,
     ):
         """Paired posterior/prior path with a frozen target and causal rollout."""
 
@@ -618,20 +619,36 @@ class VLA_JEPA(baseframework):
                 f"missing for samples {missing_fps}."
             )
         latent_config = self.config.framework.latent_alignment
-        posterior_view_index = int(
+        default_posterior_view_index = int(
             latent_config.get("posterior_video_view_index", 0)
         )
-        if not 0 <= posterior_view_index < num_views:
+        posterior_view_indices = [
+            int(
+                example.get(
+                    "posterior_video_view_index",
+                    default_posterior_view_index,
+                )
+            )
+            for example in examples
+        ]
+        invalid_view_indices = sorted(
+            {
+                view_index
+                for view_index in posterior_view_indices
+                if not 0 <= view_index < num_views
+            }
+        )
+        if invalid_view_indices:
             raise ValueError(
-                f"posterior_video_view_index={posterior_view_index} is out of range "
-                f"for {num_views} views."
+                "Posterior video view indices "
+                f"{invalid_view_indices} are out of range for {num_views} views."
             )
         posterior_videos = [
             [
                 frame if isinstance(frame, Image.Image) else Image.fromarray(frame)
-                for frame in example["video"][posterior_view_index]
+                for frame in example["video"][view_index]
             ]
-            for example in examples
+            for example, view_index in zip(examples, posterior_view_indices)
         ]
         posterior_instructions = (
             instructions if self.posterior_use_instruction else [""] * batch_size
@@ -668,12 +685,17 @@ class VLA_JEPA(baseframework):
             dynamics_scale=self.kl_dynamics_scale,
             representation_scale=self.kl_representation_scale,
         )
-        posterior_sample = self.code_projector.sample(
-            posterior_mean,
-            posterior_logvar,
+        wm_mean, wm_logvar = (
+            (prior_mean, prior_logvar)
+            if use_prior_for_wm
+            else (posterior_mean, posterior_logvar)
+        )
+        wm_sample = self.code_projector.sample(
+            wm_mean,
+            wm_logvar,
             deterministic=(not self.training and self.deterministic_latent_eval),
         )
-        posterior_codes = posterior_sample.view(
+        wm_codes = wm_sample.view(
             batch_size,
             rollout_steps,
             code_tokens_per_step,
@@ -688,12 +710,12 @@ class VLA_JEPA(baseframework):
         if self.training:
             predicted_features = self.vj_predictor.teacher_forced(
                 teacher_forcing_contexts,
-                posterior_codes,
+                wm_codes,
             )
         else:
             predicted_features = self.vj_predictor.rollout(
                 target_features[:, 0],
-                posterior_codes,
+                wm_codes,
             )
         per_step_wm_l1 = (
             predicted_features.float() - rollout_targets.float()
@@ -713,6 +735,14 @@ class VLA_JEPA(baseframework):
             "posterior_prior_mean_l1_metric": (
                 posterior_mean.float() - prior_mean.float()
             ).abs().mean().detach(),
+            "wm_prior_code_metric": torch.as_tensor(
+                float(use_prior_for_wm),
+                device=wm_l1.device,
+            ),
+            "posterior_view_index_mean_metric": torch.as_tensor(
+                sum(posterior_view_indices) / len(posterior_view_indices),
+                device=wm_l1.device,
+            ),
         }
         for step_index, step_l1 in enumerate(per_step_wm_l1, start=1):
             diagnostic_metrics[f"wm_rollout_step_{step_index}_l1_metric"] = (
@@ -724,12 +754,12 @@ class VLA_JEPA(baseframework):
                 if self.training:
                     zero_predictions = self.vj_predictor.teacher_forced(
                         teacher_forcing_contexts,
-                        torch.zeros_like(posterior_codes),
+                        torch.zeros_like(wm_codes),
                     )
                 else:
                     zero_predictions = self.vj_predictor.rollout(
                         target_features[:, 0],
-                        torch.zeros_like(posterior_codes),
+                        torch.zeros_like(wm_codes),
                     )
                 zero_code_wm_l1 = (
                     zero_predictions.float() - rollout_targets.float()
@@ -766,6 +796,7 @@ class VLA_JEPA(baseframework):
         self,
         examples: List[dict] = None,
         compute_zero_code_metric: bool = False,
+        use_prior_for_wm: bool = False,
         **kwargs,
     ) -> Tuple:
         """
@@ -787,6 +818,7 @@ class VLA_JEPA(baseframework):
                 actions=actions,
                 state=state,
                 compute_zero_code_metric=compute_zero_code_metric,
+                use_prior_for_wm=use_prior_for_wm,
             )
 
         qwen_video_kwargs = {}

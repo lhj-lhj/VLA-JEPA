@@ -92,6 +92,11 @@ framework:
     posterior_video_view_index: 0
     posterior_use_instruction: false
     posterior_prompt: "Infer the temporal dynamics from this video {actions}."
+    # Stabilize the video posterior before giving the inference-time prior a
+    # direct WM reconstruction signal. From step 2001 onward, odd optimizer
+    # steps use posterior samples and even optimizer steps use prior samples.
+    wm_posterior_only_steps: 2000
+    alternate_prior_posterior_wm: true
   reduce_in_full_precision: true
 
 datasets:
@@ -109,6 +114,11 @@ datasets:
     world_model_image_keys:
       - observation.images.exterior_1_left
       - observation.images.wrist_left
+    # Each local batch assigns exactly half of its samples to each posterior
+    # camera, then shuffles those assignments. The dual-view WM target is
+    # unchanged.
+    posterior_view_sampling: balanced_random_single
+    posterior_view_indices: [0, 1]
     continuous_action_key: action.cartesian_velocity
     gripper_action_key: action.gripper_position
     language_keys:
